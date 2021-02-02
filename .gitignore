@@ -1,0 +1,9 @@
+# Test and build artifacts
+*.tmp
+*.log
+*.gz
+tmp/
+test/tmp/
+.coverage
+*.bak
+*~
