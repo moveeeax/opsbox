@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+#
+# disk-report - human-readable disk usage for paths, with threshold warnings.
+#
+set -euo pipefail
+
+_DR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_DR_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: disk-report [OPTIONS] [PATH...]
+
+Report the size of each PATH and the usage of the filesystem that holds it.
+Paths whose filesystem usage meets or exceeds the threshold are flagged.
+
+Options:
+  -t, --threshold PCT   Warn when filesystem use% >= PCT (default: 90)
+  -h, --help            Show this help and exit
+
+If no PATH is given, the current directory is used.
+
+Example:
+  disk-report --threshold 80 / /var /home
+EOF
+}
+
+# human_bytes N -> e.g. "1.5K", "3.0M", "2.1G".
+human_bytes() {
+  local bytes="$1"
+  local -a units=(B K M G T P)
+  local i=0
+  # Work in tenths to keep one decimal without floating point.
+  local value=$((bytes * 10))
+  while [ "$value" -ge 10240 ] && [ "$i" -lt $((${#units[@]} - 1)) ]; do
+    value=$((value / 1024))
+    i=$((i + 1))
+  done
+  printf '%d.%d%s\n' $((value / 10)) $((value % 10)) "${units[i]}"
+}
+
+# du_bytes PATH -> apparent disk usage in bytes.
+du_bytes() {
+  du -sb -- "$1" 2>/dev/null | cut -f1
+}
+
+# fs_use_pct PATH -> integer filesystem use percentage (no % sign).
+fs_use_pct() {
+  df -P -- "$1" | awk 'NR==2 { gsub(/%/, "", $5); print $5 }'
+}
+
+# over_threshold PCT THRESHOLD -> exit 0 if PCT >= THRESHOLD.
+over_threshold() {
+  [ "$1" -ge "$2" ]
+}
+
+report_path() {
+  local path="$1" threshold="$2"
+  if [ ! -e "$path" ]; then
+    warn "path not found: $path"
+    return 1
+  fi
+  local bytes pct human
+  bytes="$(du_bytes "$path")"
+  pct="$(fs_use_pct "$path")"
+  human="$(human_bytes "${bytes:-0}")"
+  printf '%-30s size=%-8s fs_use=%s%%\n' "$path" "$human" "$pct"
+  if over_threshold "$pct" "$threshold"; then
+    warn "filesystem for '$path' is at ${pct}% (threshold ${threshold}%)"
+    return 2
+  fi
+  return 0
+}
+
+main() {
+  local threshold=90
+  local -a paths=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--threshold) threshold="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do paths+=("$1"); shift; done ;;
+      -*) die "unknown option: $1" ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+  case "$threshold" in
+    ''|*[!0-9]*) die "--threshold must be an integer" ;;
+  esac
+  [ "${#paths[@]}" -gt 0 ] || paths=(".")
+
+  require_cmd du df awk
+
+  local rc=0 p
+  for p in "${paths[@]}"; do
+    report_path "$p" "$threshold" || rc=1
+  done
+  return "$rc"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
