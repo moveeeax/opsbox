@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+#
+# backup - create a timestamped tar.gz of a directory and rotate old archives.
+#
+set -euo pipefail
+
+_BACKUP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_BACKUP_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: backup [OPTIONS] SOURCE_DIR
+
+Create a gzip-compressed tar archive of SOURCE_DIR with a timestamped name
+and rotate older archives, keeping only the N newest.
+
+Options:
+  -d, --dest DIR    Directory to write archives to (default: current dir)
+  -k, --keep N      Number of archives to keep after rotation (default: 5)
+  -h, --help        Show this help and exit
+
+Example:
+  backup --dest /var/backups --keep 7 /etc
+EOF
+}
+
+# archive_name BASENAME -> "<basename>-YYYYmmdd-HHMMSS.tar.gz"
+archive_name() {
+  local base="$1"
+  printf '%s-%s.tar.gz\n' "$base" "$(date +%Y%m%d-%H%M%S)"
+}
+
+# create_archive SOURCE_DIR DEST_DIR -> path of created archive (stdout)
+create_archive() {
+  local src="$1" dest="$2"
+  [ -d "$src" ] || die "source directory not found: $src"
+  mkdir -p "$dest"
+  local base name out
+  base="$(basename "$src")"
+  name="$(archive_name "$base")"
+  out="${dest}/${name}"
+  # -C into the parent so archive holds a relative path, not an absolute one.
+  tar -czf "$out" -C "$(dirname "$src")" "$base"
+  printf '%s\n' "$out"
+}
+
+# rotate_archives DEST_DIR BASENAME KEEP
+# Remove all but the KEEP newest "<basename>-*.tar.gz" files in DEST_DIR.
+rotate_archives() {
+  local dest="$1" base="$2" keep="$3"
+  local -a files=()
+  local f
+  # Newest first by mtime.
+  while IFS= read -r f; do
+    [ -n "$f" ] && files+=("$f")
+  done < <(find "$dest" -maxdepth 1 -type f -name "${base}-*.tar.gz" -printf '%T@ %p\n' \
+    | sort -rn | cut -d' ' -f2-)
+
+  local i
+  for ((i = keep; i < ${#files[@]}; i++)); do
+    info "rotating out old archive: ${files[i]}"
+    rm -f -- "${files[i]}"
+  done
+}
+
+main() {
+  local dest="." keep=5
+  local -a positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d|--dest) dest="$2"; shift 2 ;;
+      -k|--keep) keep="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
+      -*) die "unknown option: $1" ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+
+  [ "${#positional[@]}" -eq 1 ] || { usage >&2; die "exactly one SOURCE_DIR required"; }
+  case "$keep" in
+    ''|*[!0-9]*) die "--keep must be a non-negative integer" ;;
+  esac
+
+  require_cmd tar gzip find sort
+
+  local src="${positional[0]}" out base
+  out="$(create_archive "$src" "$dest")"
+  info "created archive: $out"
+  base="$(basename "$src")"
+  rotate_archives "$dest" "$base" "$keep"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
