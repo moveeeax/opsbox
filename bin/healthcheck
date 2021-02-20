@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+#
+# healthcheck - probe host:port and http(s) targets for reachability.
+#
+set -euo pipefail
+
+_HC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_HC_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: healthcheck [OPTIONS] TARGET...
+
+Probe each TARGET and exit non-zero if any is unreachable.
+
+A TARGET is one of:
+  host:port           TCP connect check (e.g. db.internal:5432)
+  http(s)://url       HTTP check expecting a 2xx/3xx response
+
+Options:
+  -t, --timeout SEC   Per-target timeout in seconds (default: 5)
+  -h, --help          Show this help and exit
+
+Example:
+  healthcheck --timeout 3 localhost:22 https://example.com
+EOF
+}
+
+# classify_target TARGET -> prints "http" or "tcp", or fails.
+classify_target() {
+  local t="$1"
+  if [[ "$t" =~ ^https?:// ]]; then
+    printf 'http\n'
+  elif [[ "$t" =~ ^[A-Za-z0-9_.-]+:[0-9]+$ ]]; then
+    printf 'tcp\n'
+  else
+    return 1
+  fi
+}
+
+# check_tcp HOST PORT TIMEOUT -> 0 if a TCP connection opens.
+check_tcp() {
+  local host="$1" port="$2" timeout="$3"
+  timeout "$timeout" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
+}
+
+# check_http URL TIMEOUT -> 0 if the URL returns success.
+check_http() {
+  local url="$1" timeout="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sSf --max-time "$timeout" -o /dev/null "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T "$timeout" -t 1 -O /dev/null "$url"
+  else
+    die "healthcheck needs curl or wget for http targets"
+  fi
+}
+
+# check_target TARGET TIMEOUT -> dispatch by type, 0 on reachable.
+check_target() {
+  local target="$1" timeout="$2" kind
+  if ! kind="$(classify_target "$target")"; then
+    warn "unrecognised target: $target"
+    return 2
+  fi
+  case "$kind" in
+    http) check_http "$target" "$timeout" ;;
+    tcp)
+      local host="${target%:*}" port="${target##*:}"
+      check_tcp "$host" "$port" "$timeout"
+      ;;
+  esac
+}
+
+main() {
+  local timeout=5
+  local -a targets=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--timeout) timeout="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do targets+=("$1"); shift; done ;;
+      -*) die "unknown option: $1" ;;
+      *) targets+=("$1"); shift ;;
+    esac
+  done
+  case "$timeout" in
+    ''|*[!0-9]*) die "--timeout must be an integer" ;;
+  esac
+  [ "${#targets[@]}" -gt 0 ] || { usage >&2; die "at least one TARGET required"; }
+
+  require_cmd timeout
+
+  local rc=0 t
+  for t in "${targets[@]}"; do
+    if check_target "$t" "$timeout"; then
+      info "OK   $t"
+    else
+      warn "FAIL $t"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
