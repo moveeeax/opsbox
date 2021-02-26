@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+#
+# logrotate-lite - size-based rotation of a single logfile, keep N, optional gzip.
+#
+set -euo pipefail
+
+_LR_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_LR_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: logrotate-lite [OPTIONS] LOGFILE
+
+Rotate LOGFILE when it reaches a size threshold. Old copies are numbered
+LOGFILE.1, LOGFILE.2, ... and the oldest beyond --keep is discarded.
+
+Options:
+  -s, --size SIZE   Rotate when the file is at least SIZE (e.g. 1048576,
+                    512K, 10M). Default: 1M
+  -k, --keep N      Number of rotated copies to keep (default: 5)
+  -z, --gzip        Compress rotated copies with gzip
+  -f, --force       Rotate regardless of current size
+  -h, --help        Show this help and exit
+
+Example:
+  logrotate-lite --size 10M --keep 7 --gzip /var/log/app.log
+EOF
+}
+
+# parse_size SIZE -> bytes. Accepts plain integer or K/M/G/T suffix.
+parse_size() {
+  local s="$1" num unit
+  num="${s%[KkMmGgTt]}"
+  unit="${s#"$num"}"
+  case "$num" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$unit" in
+    ''|B|b) printf '%s\n' "$num" ;;
+    K|k) printf '%s\n' $((num * 1024)) ;;
+    M|m) printf '%s\n' $((num * 1024 * 1024)) ;;
+    G|g) printf '%s\n' $((num * 1024 * 1024 * 1024)) ;;
+    T|t) printf '%s\n' $((num * 1024 * 1024 * 1024 * 1024)) ;;
+    *) return 1 ;;
+  esac
+}
+
+# file_size PATH -> size in bytes (0 if missing).
+file_size() {
+  if [ -f "$1" ]; then
+    stat -c '%s' -- "$1"
+  else
+    printf '0\n'
+  fi
+}
+
+# rotate_file LOGFILE KEEP GZIP(0|1)
+rotate_file() {
+  local log="$1" keep="$2" gzip_on="$3"
+  local ext=""
+  [ "$gzip_on" -eq 1 ] && ext=".gz"
+
+  # Drop the oldest rotated copy if present.
+  rm -f -- "${log}.${keep}${ext}"
+
+  # Shift numbered copies upward: .N-1 -> .N, ... .1 -> .2
+  local i
+  for ((i = keep - 1; i >= 1; i--)); do
+    if [ -f "${log}.${i}${ext}" ]; then
+      mv -- "${log}.${i}${ext}" "${log}.$((i + 1))${ext}"
+    fi
+  done
+
+  # Move the live log to .1, optionally compressing.
+  mv -- "$log" "${log}.1"
+  if [ "$gzip_on" -eq 1 ]; then
+    gzip -f -- "${log}.1"
+  fi
+
+  # Recreate an empty logfile with the same ownership/mode where possible.
+  : > "$log"
+  info "rotated $log"
+}
+
+main() {
+  local size_spec="1M" keep=5 gzip_on=0 force=0
+  local -a positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -s|--size) size_spec="$2"; shift 2 ;;
+      -k|--keep) keep="$2"; shift 2 ;;
+      -z|--gzip) gzip_on=1; shift ;;
+      -f|--force) force=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
+      -*) die "unknown option: $1" ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+
+  [ "${#positional[@]}" -eq 1 ] || { usage >&2; die "exactly one LOGFILE required"; }
+  case "$keep" in
+    ''|*[!0-9]*) die "--keep must be a non-negative integer" ;;
+  esac
+  local threshold
+  threshold="$(parse_size "$size_spec")" || die "invalid --size: $size_spec"
+
+  [ "$gzip_on" -eq 0 ] || require_cmd gzip
+
+  local log="${positional[0]}"
+  [ -f "$log" ] || die "logfile not found: $log"
+
+  local current
+  current="$(file_size "$log")"
+  if [ "$force" -eq 1 ] || [ "$current" -ge "$threshold" ]; then
+    rotate_file "$log" "$keep" "$gzip_on"
+  else
+    info "no rotation: $log is ${current}B (< ${threshold}B)"
+  fi
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
