@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+#
+# prune-old - remove files older than N days under a path. Dry-run by default.
+#
+set -euo pipefail
+
+_PO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_PO_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: prune-old [OPTIONS] PATH
+
+Find files under PATH whose modification time is older than N days.
+By default this only reports what it would delete; pass --apply to remove.
+
+Options:
+  -d, --days N        Age threshold in days (default: 30)
+  -p, --pattern GLOB  Only match files by this find -name glob (default: *)
+      --apply         Actually delete matched files (default: dry-run)
+  -h, --help          Show this help and exit
+
+Example:
+  prune-old --days 7 --pattern '*.log' --apply /var/log/app
+EOF
+}
+
+# find_old_files PATH DAYS PATTERN -> newline-separated matching file paths.
+find_old_files() {
+  local path="$1" days="$2" pattern="$3"
+  find "$path" -type f -name "$pattern" -mtime +"$days" -print
+}
+
+# prune_old PATH DAYS PATTERN APPLY(0|1)
+# Prints one action line per file. Returns the number of matched files as exit
+# status is not suitable (capped at 255), so callers read stdout for detail.
+prune_old() {
+  local path="$1" days="$2" pattern="$3" apply="$4"
+  local f count=0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    count=$((count + 1))
+    if [ "$apply" -eq 1 ]; then
+      rm -f -- "$f"
+      printf 'removed %s\n' "$f"
+    else
+      printf 'would remove %s\n' "$f"
+    fi
+  done < <(find_old_files "$path" "$days" "$pattern")
+  info "$([ "$apply" -eq 1 ] && echo removed || echo matched) ${count} file(s)"
+}
+
+main() {
+  local days=30 pattern='*' apply=0
+  local -a positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -d|--days) days="$2"; shift 2 ;;
+      -p|--pattern) pattern="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
+      -*) die "unknown option: $1" ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+
+  [ "${#positional[@]}" -eq 1 ] || { usage >&2; die "exactly one PATH required"; }
+  case "$days" in
+    ''|*[!0-9]*) die "--days must be a non-negative integer" ;;
+  esac
+
+  require_cmd find
+
+  local path="${positional[0]}"
+  [ -d "$path" ] || die "path not found or not a directory: $path"
+
+  [ "$apply" -eq 1 ] || info "dry-run (use --apply to delete)"
+  prune_old "$path" "$days" "$pattern" "$apply"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
