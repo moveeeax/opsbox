@@ -80,9 +80,7 @@ retry() {
   shift 2
   local n=1 rc=0
   while true; do
-    if "$@"; then
-      return 0
-    fi
+    "$@" && return 0
     rc=$?
     if [ "$n" -ge "$attempts" ]; then
       return "$rc"
