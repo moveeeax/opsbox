@@ -86,9 +86,7 @@ main() {
       *) paths+=("$1"); shift ;;
     esac
   done
-  case "$threshold" in
-    ''|*[!0-9]*) die "--threshold must be an integer" ;;
-  esac
+  is_uint "$threshold" || die "--threshold must be an integer"
   [ "${#paths[@]}" -gt 0 ] || paths=(".")
 
   require_cmd du df awk

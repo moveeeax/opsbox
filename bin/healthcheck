@@ -86,9 +86,7 @@ main() {
       *) targets+=("$1"); shift ;;
     esac
   done
-  case "$timeout" in
-    ''|*[!0-9]*) die "--timeout must be an integer" ;;
-  esac
+  is_uint "$timeout" || die "--timeout must be an integer"
   [ "${#targets[@]}" -gt 0 ] || { usage >&2; die "at least one TARGET required"; }
 
   require_cmd timeout

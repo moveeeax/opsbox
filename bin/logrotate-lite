@@ -101,9 +101,7 @@ main() {
   done
 
   [ "${#positional[@]}" -eq 1 ] || { usage >&2; die "exactly one LOGFILE required"; }
-  case "$keep" in
-    ''|*[!0-9]*) die "--keep must be a non-negative integer" ;;
-  esac
+  is_uint "$keep" || die "--keep must be a non-negative integer"
   local threshold
   threshold="$(parse_size "$size_spec")" || die "invalid --size: $size_spec"
 

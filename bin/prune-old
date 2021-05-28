@@ -68,9 +68,7 @@ main() {
   done
 
   [ "${#positional[@]}" -eq 1 ] || { usage >&2; die "exactly one PATH required"; }
-  case "$days" in
-    ''|*[!0-9]*) die "--days must be a non-negative integer" ;;
-  esac
+  is_uint "$days" || die "--days must be a non-negative integer"
 
   require_cmd find
 

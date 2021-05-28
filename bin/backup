@@ -80,9 +80,7 @@ main() {
   done
 
   [ "${#positional[@]}" -eq 1 ] || { usage >&2; die "exactly one SOURCE_DIR required"; }
-  case "$keep" in
-    ''|*[!0-9]*) die "--keep must be a non-negative integer" ;;
-  esac
+  is_uint "$keep" || die "--keep must be a non-negative integer"
 
   require_cmd tar gzip find sort
 
