@@ -53,6 +53,19 @@ require_cmd() {
   [ "$missing" -eq 0 ] || die "missing required command(s)"
 }
 
+# opsbox_version - print the toolkit version from the VERSION file.
+opsbox_version() {
+  local here version_file
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  version_file="${here}/../VERSION"
+  if [ -f "$version_file" ]; then
+    tr -d '[:space:]' < "$version_file"
+    printf '\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
 # is_uint VALUE - succeed if VALUE is a non-negative integer.
 is_uint() {
   case "${1:-}" in

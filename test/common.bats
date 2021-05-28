@@ -34,6 +34,12 @@ teardown() {
   [ "$status" -ne 0 ]
 }
 
+@test "opsbox_version reads the VERSION file" {
+  run opsbox_version
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")" ]
+}
+
 @test "is_uint accepts non-negative integers" {
   run is_uint 0
   [ "$status" -eq 0 ]
