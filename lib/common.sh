@@ -53,6 +53,14 @@ require_cmd() {
   [ "$missing" -eq 0 ] || die "missing required command(s)"
 }
 
+# is_uint VALUE - succeed if VALUE is a non-negative integer.
+is_uint() {
+  case "${1:-}" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 # make_tmpdir [PREFIX] - create a temp dir and echo its path.
 # The directory is registered for cleanup via cleanup_tmpdirs / trap.
 _OPSBOX_TMPDIRS=()

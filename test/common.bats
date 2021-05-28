@@ -34,6 +34,24 @@ teardown() {
   [ "$status" -ne 0 ]
 }
 
+@test "is_uint accepts non-negative integers" {
+  run is_uint 0
+  [ "$status" -eq 0 ]
+  run is_uint 42
+  [ "$status" -eq 0 ]
+}
+
+@test "is_uint rejects non-integers and empty" {
+  run is_uint -1
+  [ "$status" -ne 0 ]
+  run is_uint 1.5
+  [ "$status" -ne 0 ]
+  run is_uint abc
+  [ "$status" -ne 0 ]
+  run is_uint ""
+  [ "$status" -ne 0 ]
+}
+
 @test "make_tmpdir creates a directory" {
   dir="$(make_tmpdir opsbox-test)"
   [ -d "$dir" ]
