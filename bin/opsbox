@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#
+# opsbox - dispatcher that runs the toolkit's subcommands.
+#
+set -euo pipefail
+
+_OB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_OB_DIR}/../lib/common.sh"
+
+OPSBOX_COMMANDS=(backup disk-report healthcheck logrotate-lite prune-old)
+
+usage() {
+  cat <<EOF
+Usage: opsbox [--version] [--help] COMMAND [ARGS...]
+
+A toolkit of small bash ops helpers. Run a subcommand with --help for its
+own options.
+
+Commands:
+  backup           Create timestamped tar.gz archives and rotate old ones
+  disk-report      Report disk usage with threshold warnings
+  healthcheck      Probe host:port and http(s) targets
+  logrotate-lite   Size-based logfile rotation with optional gzip
+  prune-old        Delete files older than N days (dry-run by default)
+
+Examples:
+  opsbox backup --dest /var/backups --keep 7 /etc
+  opsbox healthcheck --timeout 3 db:5432 https://example.com
+EOF
+}
+
+# is_command NAME -> 0 if NAME is a known subcommand.
+is_command() {
+  local name="$1" c
+  for c in "${OPSBOX_COMMANDS[@]}"; do
+    [ "$c" = "$name" ] && return 0
+  done
+  return 1
+}
+
+main() {
+  if [ $# -eq 0 ]; then
+    usage >&2
+    die "no command given"
+  fi
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) opsbox_version; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+  esac
+
+  local cmd="$1"
+  shift
+  is_command "$cmd" || { usage >&2; die "unknown command: $cmd"; }
+
+  local target="${_OB_DIR}/${cmd}"
+  [ -x "$target" ] || die "command not executable: $target"
+  exec "$target" "$@"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi
