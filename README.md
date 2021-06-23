@@ -23,6 +23,15 @@ test/           bats test suite
 
 ## Commands
 
+All tools can be run directly (`bin/backup ...`) or through the `opsbox`
+dispatcher, which forwards to the matching subcommand:
+
+```sh
+opsbox backup --dest /var/backups --keep 7 /etc
+opsbox --version
+opsbox --help          # list all subcommands
+```
+
 ### `backup`
 
 Create a timestamped `tar.gz` of a directory and rotate old archives.
@@ -89,6 +98,16 @@ scratch space and a `retry N DELAY CMD...` helper. Source it from a script:
 
 ```sh
 source "$(dirname "$0")/../lib/common.sh"
+```
+
+## Installation
+
+Install the scripts and library under a prefix (default `/usr/local`):
+
+```sh
+sudo make install               # -> /usr/local/bin, /usr/local/lib/common.sh
+make install PREFIX=$HOME/.local # user-local install
+make uninstall                  # remove an installed copy
 ```
 
 ## Development
