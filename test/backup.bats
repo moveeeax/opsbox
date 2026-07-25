@@ -49,6 +49,25 @@ teardown() {
   [ ! -f "$TMP/out/data-20210101-000000.tar.gz" ]
 }
 
+@test "rotate_archives reads a leading-zero keep as decimal, not octal" {
+  mkdir -p "$TMP/out"
+  # Ten archives, oldest first. "08" is not a valid octal literal, so an
+  # arithmetic context that does not force base 10 aborts the rotation loop
+  # and leaves every archive in place while still exiting 0.
+  for i in 01 02 03 04 05 06 07 08 09 10; do
+    f="$TMP/out/data-202101${i}-000000.tar.gz"
+    echo x > "$f"
+    touch -d "2021-01-${i} 00:00:00" "$f"
+  done
+  rotate_archives "$TMP/out" "data" 08
+  count="$(find "$TMP/out" -name 'data-*.tar.gz' | wc -l)"
+  [ "$count" -eq 8 ]
+  # The two oldest are the ones that go.
+  [ ! -f "$TMP/out/data-20210101-000000.tar.gz" ]
+  [ ! -f "$TMP/out/data-20210102-000000.tar.gz" ]
+  [ -f "$TMP/out/data-20210110-000000.tar.gz" ]
+}
+
 @test "main creates an archive end to end" {
   mkdir -p "$TMP/src"
   echo data > "$TMP/src/a"

@@ -36,8 +36,17 @@ find_old_files() {
 # prune_old PATH DAYS PATTERN APPLY(0|1)
 # Prints one action line per file. Returns the number of matched files as exit
 # status is not suitable (capped at 255), so callers read stdout for detail.
+# Returns find's exit status if the scan itself failed.
 prune_old() {
   local path="$1" days="$2" pattern="$3" apply="$4"
+
+  # Collect via command substitution rather than piping find into `while read`:
+  # a process substitution discards find's exit status, so a scan that failed
+  # (missing path, unreadable subtree) would still report "matched 0 file(s)"
+  # and exit 0 - indistinguishable from "there was nothing to prune".
+  local listing find_rc=0
+  listing="$(find_old_files "$path" "$days" "$pattern")" || find_rc=$?
+
   local f count=0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -48,8 +57,13 @@ prune_old() {
     else
       printf 'would remove %s\n' "$f"
     fi
-  done < <(find_old_files "$path" "$days" "$pattern")
+  done <<< "$listing"
   info "$([ "$apply" -eq 1 ] && echo removed || echo matched) ${count} file(s)"
+
+  if [ "$find_rc" -ne 0 ]; then
+    warn "find exited ${find_rc} while scanning ${path}; results are incomplete"
+    return "$find_rc"
+  fi
 }
 
 main() {
