@@ -32,7 +32,7 @@ EOF
 # parse_size SIZE -> bytes. Accepts plain integer or K/M/G/T suffix.
 parse_size() {
   local s="$1" num unit
-  num="${s%[KkMmGgTt]}"
+  num="${s%[KkMmGgTtBb]}"
   unit="${s#"$num"}"
   case "$num" in
     ''|*[!0-9]*) return 1 ;;
@@ -62,6 +62,18 @@ rotate_file() {
   local ext=""
   [ "$gzip_on" -eq 1 ] && ext=".gz"
 
+  # Force base 10. A caller-supplied "08" or "09" is otherwise read as octal
+  # by (( )), which aborts the shift loop below and leaves rotation silently
+  # incomplete while the script still exits 0.
+  keep=$((10#$keep))
+
+  # Record the live log's mode and ownership before it is moved away so the
+  # replacement can be recreated the same, rather than inheriting whatever
+  # the current umask happens to produce.
+  local mode owner
+  mode="$(stat -c '%a' -- "$log")"
+  owner="$(stat -c '%u:%g' -- "$log")"
+
   # Drop the oldest rotated copy if present.
   rm -f -- "${log}.${keep}${ext}"
 
@@ -80,7 +92,12 @@ rotate_file() {
   fi
 
   # Recreate an empty logfile with the same ownership/mode where possible.
-  : > "$log"
+  # Created under a restrictive umask first so it is never, even briefly,
+  # more permissive than the file it replaces.
+  ( umask 077; : > "$log" )
+  chmod -- "$mode" "$log"
+  # Only a privileged user can hand a file to another owner; ignore failure.
+  chown -- "$owner" "$log" 2>/dev/null || true
   info "rotated $log"
 }
 

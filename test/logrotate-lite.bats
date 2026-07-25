@@ -36,6 +36,15 @@ make_file() {
   [ "$status" -ne 0 ]
 }
 
+@test "parse_size accepts an explicit B suffix" {
+  run parse_size 512B
+  [ "$status" -eq 0 ]
+  [ "$output" -eq 512 ]
+  run parse_size 512b
+  [ "$status" -eq 0 ]
+  [ "$output" -eq 512 ]
+}
+
 @test "file_size reports byte count" {
   make_file "$TMP/f" 123
   run file_size "$TMP/f"
@@ -87,4 +96,25 @@ make_file() {
   run main --force "$TMP/app.log"
   [ "$status" -eq 0 ]
   [ -f "$TMP/app.log.1" ]
+}
+
+@test "rotation preserves the logfile's mode" {
+  make_file "$TMP/app.log" 10
+  chmod 600 "$TMP/app.log"
+  run main --force "$TMP/app.log"
+  [ "$status" -eq 0 ]
+  # The replacement must not silently widen to the umask default (usually 644):
+  # a 0600 log holding sensitive lines has to stay 0600 after rotation.
+  [ "$(stat -c '%a' "$TMP/app.log")" = "600" ]
+  [ "$(stat -c '%a' "$TMP/app.log.1")" = "600" ]
+}
+
+@test "a keep value with a leading zero is read as decimal, not octal" {
+  make_file "$TMP/app.log" 10
+  echo one > "$TMP/app.log.1"
+  rotate_file "$TMP/app.log" 09 0
+  # The previous .1 must have been shifted up to .2, not clobbered by the
+  # incoming log because the shift loop failed to run.
+  [ -f "$TMP/app.log.2" ]
+  grep -q one "$TMP/app.log.2"
 }

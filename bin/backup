@@ -50,6 +50,10 @@ create_archive() {
 # Remove all but the KEEP newest "<basename>-*.tar.gz" files in DEST_DIR.
 rotate_archives() {
   local dest="$1" base="$2" keep="$3"
+  # Force base 10. A caller-supplied "08" or "09" is otherwise read as octal
+  # by (( )), which aborts the rotation loop below and leaves every archive
+  # in place while the script still exits 0.
+  keep=$((10#$keep))
   local -a files=()
   local f
   # Newest first by mtime.

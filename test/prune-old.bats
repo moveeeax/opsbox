@@ -46,6 +46,13 @@ teardown() {
   [ -f "$TMP/recent.log" ]
 }
 
+@test "prune_old surfaces a failed scan instead of reporting zero matches" {
+  # find cannot read this path at all, so "0 files matched" would be a lie.
+  run prune_old "$TMP/definitely-missing" 30 '*' 0
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"results are incomplete"* ]]
+}
+
 @test "main defaults to dry-run" {
   run main --days 30 "$TMP"
   [ "$status" -eq 0 ]
