@@ -19,6 +19,14 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/).
 - `prune-old` no longer discards `find`'s exit status. A scan that failed
   reported "matched 0 file(s)" and exited 0, indistinguishable from a clean
   run with nothing to prune; it now warns and exits non-zero.
+- `backup` removes the output file and fails loudly when `tar` exits nonzero
+  instead of leaving a truncated `.tar.gz` behind. That partial archive
+  previously looked like a normal backup and would eventually get counted
+  among the "N newest" kept by rotation.
+- `logrotate-lite` recreates the live logfile even when `gzip` fails on the
+  just-rotated copy. Previously a failed `gzip` (e.g. a full disk) aborted
+  the script right after the live log had already been moved aside, leaving
+  nothing at the original path until the next successful rotation.
 
 ### Changed
 - CI: `actions/checkout` v2 -> v5, bats-core pinned to `v1.14.0`, and the

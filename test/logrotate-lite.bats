@@ -109,6 +109,22 @@ make_file() {
   [ "$(stat -c '%a' "$TMP/app.log.1")" = "600" ]
 }
 
+@test "rotate_file recreates the logfile even when gzip fails" {
+  make_file "$TMP/app.log" 10
+  mkdir -p "$TMP/bin"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin/gzip"
+  chmod +x "$TMP/bin/gzip"
+  PATH="$TMP/bin:$PATH"
+  run rotate_file "$TMP/app.log" 3 1
+  # A failed gzip is surfaced as a failure, not silently swallowed.
+  [ "$status" -ne 0 ]
+  # But the live log must exist again regardless - otherwise anything still
+  # writing to it by path has nowhere to write until the next rotation.
+  [ -f "$TMP/app.log" ]
+  [ -f "$TMP/app.log.1" ]
+  [ ! -f "$TMP/app.log.1.gz" ]
+}
+
 @test "a keep value with a leading zero is read as decimal, not octal" {
   make_file "$TMP/app.log" 10
   echo one > "$TMP/app.log.1"

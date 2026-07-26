@@ -42,7 +42,19 @@ create_archive() {
   name="$(archive_name "$base")"
   out="${dest}/${name}"
   # -C into the parent so archive holds a relative path, not an absolute one.
-  tar -czf "$out" -C "$(dirname "$src")" "$base"
+  # Any nonzero tar exit means the archive cannot be trusted (truncated by a
+  # full disk, unreadable source file, permission error mid-write, ...), so
+  # remove it rather than leaving a half-written .tar.gz on disk where
+  # rotate_archives would later count it as a good backup. Exit-code
+  # conventions for "some files differ" vs. a hard failure are not portable
+  # across tar implementations, so treat every failure the same way: no
+  # trustworthy archive, no file left behind.
+  local tar_rc=0
+  tar -czf "$out" -C "$(dirname "$src")" "$base" || tar_rc=$?
+  if [ "$tar_rc" -ne 0 ]; then
+    rm -f -- "$out"
+    die "tar failed (rc=${tar_rc}) creating ${out}; removed partial archive"
+  fi
   printf '%s\n' "$out"
 }
 
