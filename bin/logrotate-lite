@@ -85,10 +85,17 @@ rotate_file() {
     fi
   done
 
-  # Move the live log to .1, optionally compressing.
+  # Move the live log to .1, optionally compressing. gzip can fail on a
+  # transient condition (disk full, etc.) after the mv has already
+  # succeeded; if it does, the log must still be recreated below rather than
+  # left missing at its original path for the rest of the run - anything
+  # still writing to $log by path (not by fd) would otherwise lose every
+  # line logged between now and the next rotation, or worse, silently
+  # recreate the path itself with the wrong mode.
   mv -- "$log" "${log}.1"
+  local gzip_rc=0
   if [ "$gzip_on" -eq 1 ]; then
-    gzip -f -- "${log}.1"
+    gzip -f -- "${log}.1" || gzip_rc=$?
   fi
 
   # Recreate an empty logfile with the same ownership/mode where possible.
@@ -98,6 +105,11 @@ rotate_file() {
   chmod -- "$mode" "$log"
   # Only a privileged user can hand a file to another owner; ignore failure.
   chown -- "$owner" "$log" 2>/dev/null || true
+
+  if [ "$gzip_rc" -ne 0 ]; then
+    warn "gzip failed (rc=${gzip_rc}) compressing ${log}.1; rotated copy was left uncompressed"
+    return "$gzip_rc"
+  fi
   info "rotated $log"
 }
 

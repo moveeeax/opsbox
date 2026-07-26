@@ -32,6 +32,22 @@ teardown() {
   [ "$status" -ne 0 ]
 }
 
+@test "create_archive removes a partial archive when tar fails" {
+  mkdir -p "$TMP/src" "$TMP/out"
+  echo hello > "$TMP/src/file.txt"
+  # No write permission on the destination: tar's open() fails immediately.
+  # Skip under root, which ignores permission bits.
+  if [ "$(id -u)" -eq 0 ]; then
+    skip "cannot deny write access while running as root"
+  fi
+  chmod 500 "$TMP/out"
+  run create_archive "$TMP/src" "$TMP/out"
+  chmod 700 "$TMP/out"
+  [ "$status" -ne 0 ]
+  count="$(find "$TMP/out" -type f | wc -l)"
+  [ "$count" -eq 0 ]
+}
+
 @test "rotate_archives keeps only the N newest" {
   mkdir -p "$TMP/out"
   # Create six archives with increasing mtimes.
