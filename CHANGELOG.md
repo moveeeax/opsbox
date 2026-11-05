@@ -5,6 +5,33 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+Planned as 0.2.0 (`VERSION` already reads `0.2.0`).
+
+### Fixed
+- `opsbox --version` printed `unknown` after `make install`, because the
+  `VERSION` file was never installed. `make install` now copies it to
+  `$(PREFIX)/share/opsbox/VERSION` (removed again by `make uninstall`), and
+  `opsbox_version` looks there when no source-checkout `VERSION` is present.
+- `backup` removes the output file and fails loudly when `tar` exits nonzero
+  instead of leaving a truncated `.tar.gz` behind. That partial archive
+  previously looked like a normal backup and would eventually get counted
+  among the "N newest" kept by rotation.
+- `logrotate-lite` recreates the live logfile even when `gzip` fails on the
+  just-rotated copy. Previously a failed `gzip` (e.g. a full disk) aborted
+  the script right after the live log had already been moved aside, leaving
+  nothing at the original path until the next successful rotation.
+
+### Changed
+- CI: `actions/checkout` v5 -> v7.
+- Docs: README and `logrotate-lite --help` list the `B` size suffix and note
+  that suffixes are case-insensitive.
+
+## [0.1.0] - 2026-07-26
+
+The `v0.1.0` tag points at commit `7842420`, so besides the initial feature
+set it also contains the fixes below, which earlier versions of this file
+listed under Unreleased. The feature set itself was completed in June 2021.
+
 ### Fixed
 - `logrotate-lite` recreates the rotated logfile with the original file's mode
   and ownership instead of whatever the current umask produces. A `0600` log
@@ -19,20 +46,10 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/).
 - `prune-old` no longer discards `find`'s exit status. A scan that failed
   reported "matched 0 file(s)" and exited 0, indistinguishable from a clean
   run with nothing to prune; it now warns and exits non-zero.
-- `backup` removes the output file and fails loudly when `tar` exits nonzero
-  instead of leaving a truncated `.tar.gz` behind. That partial archive
-  previously looked like a normal backup and would eventually get counted
-  among the "N newest" kept by rotation.
-- `logrotate-lite` recreates the live logfile even when `gzip` fails on the
-  just-rotated copy. Previously a failed `gzip` (e.g. a full disk) aborted
-  the script right after the live log had already been moved aside, leaving
-  nothing at the original path until the next successful rotation.
 
 ### Changed
 - CI: `actions/checkout` v2 -> v5, bats-core pinned to `v1.14.0`, and the
   workflow token scoped to `contents: read`.
-
-## [0.1.0] - 2021-01-31
 
 ### Added
 - `lib/common.sh` shared library: timestamped logging (`info`/`warn`/`die`),
