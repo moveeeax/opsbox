@@ -75,7 +75,7 @@ copies and optionally gzipping them.
 logrotate-lite --size 10M --keep 7 --gzip /var/log/app.log
 ```
 
-Options: `-s/--size SIZE` (bytes or `K`/`M`/`G`/`T` suffix), `-k/--keep N`,
+Options: `-s/--size SIZE` (bytes, or a `B`/`K`/`M`/`G`/`T` suffix, case-insensitive), `-k/--keep N`,
 `-z/--gzip`, `-f/--force`, `-h/--help`.
 
 ### `prune-old`
@@ -105,7 +105,8 @@ source "$(dirname "$0")/../lib/common.sh"
 Install the scripts and library under a prefix (default `/usr/local`):
 
 ```sh
-sudo make install               # -> /usr/local/bin, /usr/local/lib/common.sh
+sudo make install               # -> /usr/local/bin, /usr/local/lib/common.sh,
+                                #    /usr/local/share/opsbox/VERSION
 make install PREFIX=$HOME/.local # user-local install
 make uninstall                  # remove an installed copy
 ```

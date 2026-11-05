@@ -54,16 +54,19 @@ require_cmd() {
 }
 
 # opsbox_version - print the toolkit version from the VERSION file.
+# Looks next to a source checkout (<root>/VERSION) first, then in the location
+# `make install` uses (<PREFIX>/share/opsbox/VERSION).
 opsbox_version() {
   local here version_file
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  version_file="${here}/../VERSION"
-  if [ -f "$version_file" ]; then
-    tr -d '[:space:]' < "$version_file"
-    printf '\n'
-  else
-    printf 'unknown\n'
-  fi
+  for version_file in "${here}/../VERSION" "${here}/../share/opsbox/VERSION"; do
+    if [ -f "$version_file" ]; then
+      tr -d '[:space:]' < "$version_file"
+      printf '\n'
+      return 0
+    fi
+  done
+  printf 'unknown\n'
 }
 
 # is_uint VALUE - succeed if VALUE is a non-negative integer.
