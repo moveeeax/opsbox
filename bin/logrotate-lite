@@ -17,8 +17,8 @@ Rotate LOGFILE when it reaches a size threshold. Old copies are numbered
 LOGFILE.1, LOGFILE.2, ... and the oldest beyond --keep is discarded.
 
 Options:
-  -s, --size SIZE   Rotate when the file is at least SIZE (e.g. 1048576,
-                    512K, 10M). Default: 1M
+  -s, --size SIZE   Rotate when the file is at least SIZE (bytes, or with a
+                    B/K/M/G/T suffix, e.g. 512K, 10M). Default: 1M
   -k, --keep N      Number of rotated copies to keep (default: 5)
   -z, --gzip        Compress rotated copies with gzip
   -f, --force       Rotate regardless of current size
@@ -29,7 +29,8 @@ Example:
 EOF
 }
 
-# parse_size SIZE -> bytes. Accepts plain integer or K/M/G/T suffix.
+# parse_size SIZE -> bytes. Accepts plain integer or a B/K/M/G/T suffix
+# (case-insensitive).
 parse_size() {
   local s="$1" num unit
   num="${s%[KkMmGgTtBb]}"
