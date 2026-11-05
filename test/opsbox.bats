@@ -54,3 +54,20 @@ teardown() {
   count="$(find "$TMP/out" -name 'src-*.tar.gz' | wc -l)"
   [ "$count" -eq 1 ]
 }
+
+@test "opsbox --version works after make install" {
+  run make -C "$REPO_ROOT" install DESTDIR="$TMP/root" PREFIX=/usr/local
+  [ "$status" -eq 0 ]
+  run "$TMP/root/usr/local/bin/opsbox" --version
+  [ "$status" -eq 0 ]
+  [ "$output" = "$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")" ]
+  [ "$output" != "unknown" ]
+}
+
+@test "make uninstall removes the installed VERSION" {
+  make -C "$REPO_ROOT" install DESTDIR="$TMP/root" PREFIX=/usr/local
+  run make -C "$REPO_ROOT" uninstall DESTDIR="$TMP/root" PREFIX=/usr/local
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP/root/usr/local/share/opsbox/VERSION" ]
+  [ ! -e "$TMP/root/usr/local/bin/opsbox" ]
+}

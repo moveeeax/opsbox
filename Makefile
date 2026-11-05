@@ -14,6 +14,8 @@ BINDIR := $(PREFIX)/bin
 # Scripts source ../lib/common.sh relative to their own location, so the lib
 # must land in $(PREFIX)/lib to keep that path valid once installed.
 LIBDIR := $(PREFIX)/lib
+# opsbox_version looks for VERSION here once installed.
+DATADIR := $(PREFIX)/share/opsbox
 
 .PHONY: all lint test check help install uninstall
 
@@ -36,10 +38,13 @@ test:
 check: lint test
 
 install:
-	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR)
+	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(LIBDIR) $(DESTDIR)$(DATADIR)
 	install -m 0644 $(LIB) $(DESTDIR)$(LIBDIR)/common.sh
+	install -m 0644 VERSION $(DESTDIR)$(DATADIR)/VERSION
 	install -m 0755 $(SCRIPTS) $(DESTDIR)$(BINDIR)
 
 uninstall:
 	rm -f $(addprefix $(DESTDIR)$(BINDIR)/,$(notdir $(SCRIPTS)))
 	rm -f $(DESTDIR)$(LIBDIR)/common.sh
+	rm -f $(DESTDIR)$(DATADIR)/VERSION
+	-rmdir $(DESTDIR)$(DATADIR) 2>/dev/null
