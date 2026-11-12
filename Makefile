@@ -6,7 +6,8 @@ SHELL := /bin/bash
 SHELLCHECK ?= shellcheck
 BATS ?= bats
 
-SCRIPTS := bin/opsbox bin/backup bin/disk-report bin/healthcheck bin/logrotate-lite bin/prune-old
+SCRIPTS := bin/opsbox bin/backup bin/backup-verify bin/disk-report bin/healthcheck \
+           bin/logrotate-audit bin/logrotate-lite bin/procwatch bin/prune-old
 LIB := lib/common.sh
 
 PREFIX ?= /usr/local

@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+#
+# procwatch - watch processes against CPU, RSS, fd and thread thresholds and
+# report the offender with its command line, parents and systemd unit.
+#
+set -euo pipefail
+
+_PW_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_PW_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: procwatch [OPTIONS] --rule RULE [--rule RULE...]
+
+Sample every visible process from /proc and report the ones that cross a
+rule: full command line, parent chain, cgroup and systemd unit, start time.
+Reads procfs directly; without root only your own processes are visible.
+
+Rules (METRIC>VALUE, optionally followed by "for DURATION"):
+  rss>2G          resident set size (VmRSS), bytes or B/K/M/G/T suffix
+  cpu>90          CPU use in percent of one core over the last interval
+  fd>500          open file descriptors
+  fd>80%          open fds as percent of the soft "Max open files" limit
+  threads>200     thread count
+  ... for 5m      fire only after the breach held for 5m (s, m or h);
+                  a short spike that clears earlier never fires
+
+A rule fires once per process and breach; it can fire again after the value
+has dropped back below the threshold.
+
+Options:
+  -r, --rule RULE          Rule to check (repeatable, at least one)
+  -i, --interval SEC       Seconds between samples (default: 5)
+  -n, --count N            Stop after N rounds (default: 0 = run until killed)
+      --once               Same as --count 1
+  -p, --pid PID            Watch only this PID (repeatable)
+  -e, --exec CMD           Run CMD (through sh -c) when a rule fires; the
+                           offender is passed in PROCWATCH_* variables
+  -s, --snapshot-dir DIR   On fire, save /proc/PID/status, /proc/PID/limits
+                           and the most common fd targets under DIR
+  -h, --help               Show this help and exit
+
+Variables passed to --exec: PROCWATCH_PID, PROCWATCH_RULE, PROCWATCH_METRIC,
+PROCWATCH_VALUE, PROCWATCH_THRESHOLD, PROCWATCH_CMDLINE, PROCWATCH_PARENTS,
+PROCWATCH_CGROUP, PROCWATCH_UNIT, PROCWATCH_STARTED, PROCWATCH_SNAPSHOT.
+
+With --count, exits 1 if any rule fired, 0 otherwise.
+
+Example:
+  procwatch --rule 'rss>2G for 5m' --rule 'fd>80%' --exec /usr/local/bin/notify.sh
+EOF
+}
+
+# Parsed rules, index-aligned.
+PW_RULE_TEXT=()
+PW_RULE_METRIC=()
+PW_RULE_LIMIT=()     # absolute threshold (bytes, percent, count)
+PW_RULE_PCT=()       # 1 when the threshold is a percent of the fd limit
+PW_RULE_FOR=()       # seconds the breach must last
+
+# Breach tracking: key "pid:starttime:rule" -> first breach epoch / fired.
+declare -gA PW_SINCE=()
+declare -gA PW_FIRED=()
+PW_RESULT=""
+
+# parse_duration SPEC -> seconds. Accepts N, Ns, Nm, Nh.
+parse_duration() {
+  local s="$1" num unit
+  num="${s%[smh]}"
+  unit="${s#"$num"}"
+  is_uint "$num" || return 1
+  num=$((10#$num))
+  case "$unit" in
+    ''|s) printf '%s\n' "$num" ;;
+    m) printf '%s\n' $((num * 60)) ;;
+    h) printf '%s\n' $((num * 3600)) ;;
+  esac
+}
+
+# add_rule TEXT - parse and register a rule, or die with the reason.
+add_rule() {
+  local text="$1"
+  local re='^[[:space:]]*(rss|cpu|fd|threads)[[:space:]]*>[[:space:]]*([0-9]+[BbKkMmGgTt]?)(%?)([[:space:]]+for[[:space:]]+([0-9]+[smh]?))?[[:space:]]*$'
+  [[ "$text" =~ $re ]] || die "invalid rule: '$text' (expected e.g. 'rss>2G for 5m', 'fd>80%')"
+  local metric="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}" pct=0 window=0 limit
+  [ -z "${BASH_REMATCH[3]}" ] || pct=1
+  if [ -n "${BASH_REMATCH[5]}" ]; then
+    window="$(parse_duration "${BASH_REMATCH[5]}")" || die "invalid duration in rule: $text"
+  fi
+  if [ "$pct" -eq 1 ] && [ "$metric" != "fd" ]; then
+    # RLIMIT_RSS is not enforced by current kernels and the process limit is
+    # per user, so a percentage would compare against a number that means
+    # nothing for this one process.
+    die "percent thresholds are only supported for fd: $text"
+  fi
+  case "$metric" in
+    rss) limit="$(parse_size "$value")" || die "invalid size in rule: $text" ;;
+    *)
+      is_uint "$value" || die "$metric threshold must be a plain number: $text"
+      limit=$((10#$value))
+      ;;
+  esac
+  PW_RULE_TEXT+=("$text")
+  PW_RULE_METRIC+=("$metric")
+  PW_RULE_LIMIT+=("$limit")
+  PW_RULE_PCT+=("$pct")
+  PW_RULE_FOR+=("$window")
+}
+
+# proc_stat_fields PID -> the /proc/PID/stat fields after "(comm)", space
+# separated: state ppid pgrp ... (field 3 onwards in proc(5) numbering).
+# comm may itself contain spaces and parentheses, so cut at the last ")".
+proc_stat_fields() {
+  local line
+  line="$(cat -- "$(opsbox_proc_root)/$1/stat" 2>/dev/null)" || return 1
+  printf '%s\n' "${line##*) }"
+}
+
+# proc_rss PID -> VmRSS in bytes (0 for kernel threads, which have none).
+proc_rss() {
+  local kb
+  kb="$(awk '$1 == "VmRSS:" { print $2 }' "$(opsbox_proc_root)/$1/status" 2>/dev/null)" || return 1
+  printf '%s\n' $(( ${kb:-0} * 1024 ))
+}
+
+# proc_fd_count PID -> number of open fds; fails when the dir is unreadable.
+proc_fd_count() {
+  local dir
+  dir="$(opsbox_proc_root)/$1/fd"
+  [ -r "$dir" ] && [ -x "$dir" ] || return 1
+  local -a fds=("$dir"/*)
+  [ -e "${fds[0]}" ] || [ -L "${fds[0]}" ] || { printf '0\n'; return 0; }
+  printf '%s\n' "${#fds[@]}"
+}
+
+# proc_fd_limit PID -> soft "Max open files" limit, or nothing if unlimited.
+proc_fd_limit() {
+  awk '/^Max open files/ { if ($4 != "unlimited") print $4 }' "$(opsbox_proc_root)/$1/limits" 2>/dev/null
+}
+
+# proc_cmdline PID -> argv joined by spaces, or [comm] for kernel threads.
+proc_cmdline() {
+  local proc cmd
+  proc="$(opsbox_proc_root)"
+  cmd="$(tr '\0' ' ' < "$proc/$1/cmdline" 2>/dev/null)" || cmd=""
+  cmd="${cmd% }"
+  if [ -z "$cmd" ]; then
+    cmd="[$(cat -- "$proc/$1/comm" 2>/dev/null || printf '?')]"
+  fi
+  printf '%s\n' "$cmd"
+}
+
+# proc_parents PID -> "PID comm <- PPID comm <- ... <- 1 init".
+proc_parents() {
+  local pid="$1" proc chain="" comm fields depth=0
+  proc="$(opsbox_proc_root)"
+  while [ -n "$pid" ] && [ "$pid" != "0" ] && [ "$depth" -lt 64 ]; do
+    comm="$(cat -- "$proc/$pid/comm" 2>/dev/null || printf '?')"
+    chain+="${chain:+ <- }${pid} ${comm}"
+    fields="$(proc_stat_fields "$pid")" || break
+    local -a f
+    read -r -a f <<< "$fields"
+    pid="${f[1]}"
+    depth=$((depth + 1))
+  done
+  printf '%s\n' "$chain"
+}
+
+# proc_cgroup PID -> cgroup v2 path, else the v1 name=systemd path.
+proc_cgroup() {
+  awk -F: '
+    $1 == "0" && $2 == "" { v2 = $3 }
+    $2 == "name=systemd" { v1 = $3 }
+    END { if (v2 != "") print v2; else if (v1 != "") print v1 }
+  ' "$(opsbox_proc_root)/$1/cgroup" 2>/dev/null || true
+}
+
+# cgroup_unit PATH -> innermost systemd .service or .scope in the path.
+cgroup_unit() {
+  local path="$1" part unit=""
+  local IFS=/
+  for part in $path; do
+    case "$part" in
+      *.service|*.scope) unit="$part" ;;
+    esac
+  done
+  printf '%s\n' "$unit"
+}
+
+# proc_started PID -> ISO start time from boot time + starttime ticks.
+proc_started() {
+  local proc fields btime hz
+  proc="$(opsbox_proc_root)"
+  fields="$(proc_stat_fields "$1")" || return 0
+  btime="$(awk '$1 == "btime" { print $2 }' "$proc/stat" 2>/dev/null)"
+  [ -n "$btime" ] || return 0
+  hz="$(getconf CLK_TCK 2>/dev/null || printf '100')"
+  local -a f
+  read -r -a f <<< "$fields"
+  date -d "@$((btime + f[19] / hz))" +"%Y-%m-%dT%H:%M:%S%z"
+}
+
+# cpu_pct DELTA_TICKS ELAPSED_MS HZ -> integer percent of one core.
+cpu_pct() {
+  local ticks="$1" ms="$2" hz="$3"
+  [ "$ms" -gt 0 ] || return 1
+  printf '%s\n' $((ticks * 100000 / (hz * ms)))
+}
+
+# track_breach KEY BREACHED(0|1) NOW WINDOW
+# Sets PW_RESULT to "fire" the first time KEY has been in breach for at
+# least WINDOW seconds, "" otherwise. Clearing the breach re-arms the key.
+track_breach() {
+  local key="$1" breached="$2" now="$3" window="$4"
+  PW_RESULT=""
+  if [ "$breached" -eq 0 ]; then
+    unset 'PW_SINCE[$key]' 'PW_FIRED[$key]'
+    return 0
+  fi
+  [ -n "${PW_SINCE[$key]:-}" ] || PW_SINCE[$key]="$now"
+  [ -z "${PW_FIRED[$key]:-}" ] || return 0
+  if [ $((now - PW_SINCE[$key])) -ge "$window" ]; then
+    PW_FIRED[$key]=1
+    PW_RESULT=fire
+  fi
+}
+
+# save_snapshot DIR PID -> path of the snapshot dir written.
+save_snapshot() {
+  local base="$1" pid="$2" proc dest
+  proc="$(opsbox_proc_root)"
+  dest="${base}/procwatch-${pid}-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p -- "$dest"
+  cp -- "$proc/$pid/status" "$dest/status" 2>/dev/null || true
+  cp -- "$proc/$pid/limits" "$dest/limits" 2>/dev/null || true
+  local fd
+  for fd in "$proc/$pid"/fd/*; do
+    readlink -- "$fd" 2>/dev/null || true
+  done | sort | uniq -c | sort -rn | awk 'NR <= 20' > "$dest/fds.txt"
+  printf '%s\n' "$dest"
+}
+
+# format_value METRIC VALUE PCT -> value as shown in reports.
+format_value() {
+  case "$1" in
+    rss) human_bytes "$2" ;;
+    cpu) printf '%s%%\n' "$2" ;;
+    fd) if [ "$3" -eq 1 ]; then printf '%s%%\n' "$2"; else printf '%s\n' "$2"; fi ;;
+    *) printf '%s\n' "$2" ;;
+  esac
+}
+
+# fire PID RULE_INDEX VALUE SNAPSHOT_DIR EXEC_CMD - report and run hooks.
+fire() {
+  local pid="$1" i="$2" value="$3" snap_dir="$4" exec_cmd="$5"
+  local metric="${PW_RULE_METRIC[i]}" pct="${PW_RULE_PCT[i]}"
+  local cmd parents cgroup unit started shown snap=""
+  cmd="$(proc_cmdline "$pid")"
+  parents="$(proc_parents "$pid")"
+  cgroup="$(proc_cgroup "$pid")"
+  unit="$(cgroup_unit "$cgroup")"
+  started="$(proc_started "$pid")"
+  shown="$(format_value "$metric" "$value" "$pct")"
+
+  printf 'FIRED %s: pid %s %s=%s\n' "${PW_RULE_TEXT[i]}" "$pid" "$metric" "$shown"
+  printf '  cmd:     %s\n' "$cmd"
+  printf '  parents: %s\n' "$parents"
+  [ -z "$cgroup" ] || printf '  cgroup:  %s%s\n' "$cgroup" "${unit:+ (unit $unit)}"
+  [ -z "$started" ] || printf '  started: %s\n' "$started"
+  if [ -n "$snap_dir" ]; then
+    snap="$(save_snapshot "$snap_dir" "$pid")"
+    printf '  snapshot: %s\n' "$snap"
+  fi
+
+  if [ -n "$exec_cmd" ]; then
+    PROCWATCH_PID="$pid" PROCWATCH_RULE="${PW_RULE_TEXT[i]}" PROCWATCH_METRIC="$metric" \
+      PROCWATCH_VALUE="$value" PROCWATCH_THRESHOLD="${PW_RULE_LIMIT[i]}" \
+      PROCWATCH_CMDLINE="$cmd" PROCWATCH_PARENTS="$parents" PROCWATCH_CGROUP="$cgroup" \
+      PROCWATCH_UNIT="$unit" PROCWATCH_STARTED="$started" PROCWATCH_SNAPSHOT="$snap" \
+      sh -c "$exec_cmd" || warn "exec hook failed (rc=$?): $exec_cmd"
+  fi
+}
+
+# list_pids PID... -> the given PIDs, or every numeric entry under procfs.
+list_pids() {
+  if [ $# -gt 0 ]; then
+    printf '%s\n' "$@"
+    return 0
+  fi
+  local d
+  for d in "$(opsbox_proc_root)"/[0-9]*; do
+    printf '%s\n' "${d##*/}"
+  done
+}
+
+# Previous CPU sample: pid -> "starttime ticks", plus when it was taken.
+declare -gA PW_PREV_TICKS=()
+PW_PREV_NS=0
+
+# check_round NOW SNAPSHOT_DIR EXEC_CMD PRIME(0|1) PID...
+# Evaluates every rule for every process and leaves the number fired in
+# PW_FIRED_COUNT. With PRIME=1 it only records the CPU baseline. Either way
+# the CPU baseline is refreshed for the next round.
+PW_FIRED_COUNT=0
+check_round() {
+  local now="$1" snap_dir="$2" exec_cmd="$3" prime="$4"
+  shift 4
+  local hz now_ns elapsed_ms=0
+  hz="$(getconf CLK_TCK 2>/dev/null || printf '100')"
+  now_ns="$(date +%s%N)"
+  [ "$PW_PREV_NS" -eq 0 ] || elapsed_ms=$(((now_ns - PW_PREV_NS) / 1000000))
+  local -A ticks_now=()
+  local pid fields start ticks threads i metric value breached limit key
+  local -a f
+  PW_FIRED_COUNT=0
+  while IFS= read -r pid; do
+    fields="$(proc_stat_fields "$pid")" || continue
+    read -r -a f <<< "$fields"
+    # proc(5) numbering: utime=14 stime=15 num_threads=20 starttime=22; the
+    # array starts at field 3 ("state"), hence the offset of 3.
+    ticks=$((f[11] + f[12]))
+    threads="${f[17]}"
+    start="${f[19]}"
+    ticks_now[$pid]="${start} ${ticks}"
+    [ "$prime" -eq 0 ] || continue
+
+    for i in "${!PW_RULE_TEXT[@]}"; do
+      metric="${PW_RULE_METRIC[i]}"
+      limit="${PW_RULE_LIMIT[i]}"
+      value=""
+      case "$metric" in
+        rss) value="$(proc_rss "$pid")" || value="" ;;
+        threads) value="$threads" ;;
+        fd)
+          value="$(proc_fd_count "$pid")" || value=""
+          if [ -n "$value" ] && [ "${PW_RULE_PCT[i]}" -eq 1 ]; then
+            local fd_limit
+            fd_limit="$(proc_fd_limit "$pid")"
+            if [ -n "$fd_limit" ] && [ "$fd_limit" -gt 0 ]; then
+              value=$((value * 100 / fd_limit))
+            else
+              value=""
+            fi
+          fi
+          ;;
+        cpu)
+          local prev="${PW_PREV_TICKS[$pid]:-}"
+          # Same pid but a different start time is a new process.
+          if [ -n "$prev" ] && [ "${prev%% *}" = "$start" ]; then
+            value="$(cpu_pct $((ticks - ${prev#* })) "$elapsed_ms" "$hz")" || value=""
+          fi
+          ;;
+      esac
+      [ -n "$value" ] || continue
+      breached=0
+      [ "$value" -le "$limit" ] || breached=1
+      key="${pid}:${start}:${i}"
+      track_breach "$key" "$breached" "$now" "${PW_RULE_FOR[i]}"
+      if [ "$PW_RESULT" = "fire" ]; then
+        fire "$pid" "$i" "$value" "$snap_dir" "$exec_cmd"
+        PW_FIRED_COUNT=$((PW_FIRED_COUNT + 1))
+      fi
+    done
+  done < <(list_pids "$@")
+
+  PW_PREV_TICKS=()
+  for pid in "${!ticks_now[@]}"; do
+    PW_PREV_TICKS[$pid]="${ticks_now[$pid]}"
+  done
+  PW_PREV_NS="$now_ns"
+}
+
+main() {
+  local interval=5 count=0 exec_cmd="" snap_dir=""
+  local -a pids=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -r|--rule) add_rule "$2"; shift 2 ;;
+      -i|--interval) interval="$2"; shift 2 ;;
+      -n|--count) count="$2"; shift 2 ;;
+      --once) count=1; shift ;;
+      -p|--pid) pids+=("$2"); shift 2 ;;
+      -e|--exec) exec_cmd="$2"; shift 2 ;;
+      -s|--snapshot-dir) snap_dir="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) usage >&2; die "unexpected argument: $1" ;;
+    esac
+  done
+  [ "${#PW_RULE_TEXT[@]}" -gt 0 ] || { usage >&2; die "at least one --rule is required"; }
+  is_uint "$interval" || die "--interval must be a non-negative integer"
+  is_uint "$count" || die "--count must be a non-negative integer"
+  local p
+  for p in "${pids[@]}"; do
+    is_uint "$p" || die "--pid must be a number: $p"
+  done
+  [ -d "$(opsbox_proc_root)" ] || die "procfs not found at $(opsbox_proc_root)"
+  require_cmd awk getconf
+
+  local i has_cpu=0 max_for=0
+  for i in "${!PW_RULE_TEXT[@]}"; do
+    [ "${PW_RULE_METRIC[i]}" != "cpu" ] || has_cpu=1
+    [ "${PW_RULE_FOR[i]}" -le "$max_for" ] || max_for="${PW_RULE_FOR[i]}"
+  done
+  if [ "$count" -gt 0 ] && [ "$max_for" -gt $(((count - 1) * interval)) ]; then
+    warn "a 'for' window of ${max_for}s is longer than ${count} round(s) at ${interval}s can cover; it cannot fire"
+  fi
+
+  # CPU use is a rate, so the first round needs a baseline sample.
+  if [ "$has_cpu" -eq 1 ]; then
+    check_round "$(date +%s)" "" "" 1 "${pids[@]}"
+    sleep "$interval"
+  fi
+
+  local round=0 total=0
+  while true; do
+    check_round "$(date +%s)" "$snap_dir" "$exec_cmd" 0 "${pids[@]}"
+    total=$((total + PW_FIRED_COUNT))
+    round=$((round + 1))
+    if [ "$count" -gt 0 ] && [ "$round" -ge "$count" ]; then
+      break
+    fi
+    sleep "$interval"
+  done
+  [ "$total" -eq 0 ]
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

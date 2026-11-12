@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+#
+# backup-verify - restore a backup into a scratch directory and check it.
+#
+set -euo pipefail
+
+_BV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_BV_DIR}/../lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: backup-verify [OPTIONS] BACKUP
+
+Restore BACKUP into a new directory under --scratch, never over the live
+data, and check what came back. With --source, every restored file (or a
+random sample of --sample files) is compared with the live tree: checksum,
+size, mode and, when run as root, owner and group. The restore wall-clock
+time is recorded so an RTO figure can be measured rather than assumed.
+
+Drivers (each runs the real tool, which must be installed):
+  tar         BACKUP is a tar archive, compressed or not (e.g. from backup)
+  restic      BACKUP is a restic repository; restores --snapshot
+  borg        BACKUP is a borg archive, REPO::ARCHIVE
+  pg_restore  BACKUP is a pg_dump archive (custom, directory or tar format);
+              it is turned back into a plain SQL script, so no database
+              server is needed. --source does not apply.
+
+Repository passwords come from the tools' own environment variables
+(RESTIC_PASSWORD, BORG_PASSPHRASE, ...).
+
+Options:
+  -D, --driver NAME    tar, restic, borg or pg_restore (default: tar)
+  -s, --scratch DIR    Directory to create the restore dir in
+                       (default: $TMPDIR or /tmp). Must not be inside --source
+  -S, --source DIR     Live tree to compare the restored copy against
+      --root PATH      Where SOURCE sits inside the restore, relative to the
+                       restore dir. Default: tar uses basename(SOURCE),
+                       restic and borg use SOURCE without the leading /
+      --snapshot ID    restic snapshot to restore (default: latest)
+  -n, --sample N       Compare N randomly chosen files instead of all
+                       (default: 0 = all)
+  -r, --report FILE    Also write the report to FILE
+  -k, --keep-scratch   Keep the restore dir instead of deleting it
+  -h, --help           Show this help and exit
+
+A file whose live mtime differs from the restored one changed after the
+backup was taken; it is reported, not counted as a failure. A file with the
+same mtime but a different checksum, size, mode or owner is a mismatch.
+
+Exits 0 when the restore succeeded and nothing mismatched, 1 otherwise, so
+it can run from a systemd timer or cron and alert on failure.
+
+Example:
+  backup-verify --source /etc --sample 200 --report /var/log/verify.txt \
+    /var/backups/etc-20260101-020000.tar.gz
+  backup-verify --driver restic --source /srv/data --scratch /var/tmp /srv/restic
+EOF
+}
+
+# now_ns -> current time in nanoseconds (GNU date).
+now_ns() {
+  date +%s%N
+}
+
+# format_ms MS -> "S.mmm" seconds.
+format_ms() {
+  printf '%d.%03d\n' $(($1 / 1000)) $(($1 % 1000))
+}
+
+# is_within CHILD PARENT -> 0 if CHILD is PARENT or below it. Both must exist.
+is_within() {
+  local child parent
+  child="$(cd -- "$1" && pwd -P)"
+  parent="$(cd -- "$2" && pwd -P)"
+  [ "$child" = "$parent" ] && return 0
+  case "$child/" in
+    "$parent"/*) return 0 ;;
+  esac
+  return 1
+}
+
+# restore DRIVER BACKUP DEST SNAPSHOT - run the driver's real restore tool.
+restore() {
+  local driver="$1" backup="$2" dest="$3" snapshot="$4"
+  case "$driver" in
+    # -p keeps the archived mode bits even for a non-root user; tar picks the
+    # decompressor from the archive itself.
+    tar) tar -xpf "$backup" -C "$dest" ;;
+    restic) restic -r "$backup" restore "$snapshot" --target "$dest" ;;
+    # borg extracts into the current directory.
+    borg) (cd -- "$dest" && borg extract "$backup") ;;
+    # Without -d, pg_restore writes the SQL script it would have run.
+    pg_restore) pg_restore -f "$dest/restore.sql" "$backup" ;;
+    *) die "unknown driver: $driver" ;;
+  esac
+}
+
+# default_root DRIVER SOURCE DEST -> path of SOURCE inside the restore dir.
+default_root() {
+  local driver="$1" source="$2" dest="$3"
+  case "$driver" in
+    tar) printf '%s/%s\n' "$dest" "$(basename -- "$source")" ;;
+    restic|borg) printf '%s/%s\n' "$dest" "${source#/}" ;;
+  esac
+}
+
+# file_meta PATH -> "mtime size mode uid:gid"
+file_meta() {
+  stat -c '%Y %s %a %u:%g' -- "$1"
+}
+
+# compare_file RESTORED LIVE CHECK_OWNER(0|1)
+# -> one of: match, changed, missing, or "mismatch FIELD[,FIELD...]".
+compare_file() {
+  local restored="$1" live="$2" check_owner="$3"
+  if [ ! -e "$live" ] && [ ! -L "$live" ]; then
+    printf 'missing\n'
+    return 0
+  fi
+  local r_mtime r_size r_mode r_owner l_mtime l_size l_mode l_owner
+  read -r r_mtime r_size r_mode r_owner <<< "$(file_meta "$restored")"
+  read -r l_mtime l_size l_mode l_owner <<< "$(file_meta "$live")"
+  if [ "$r_mtime" != "$l_mtime" ]; then
+    printf 'changed\n'
+    return 0
+  fi
+  local -a bad=()
+  [ "$r_size" = "$l_size" ] || bad+=(size)
+  [ "$r_mode" = "$l_mode" ] || bad+=(mode)
+  [ "$check_owner" -eq 0 ] || [ "$r_owner" = "$l_owner" ] || bad+=(owner)
+  # Only hash when the sizes agree; a size mismatch already says enough.
+  if [ "$r_size" = "$l_size" ]; then
+    local r_sum l_sum
+    r_sum="$(sha256sum -- "$restored" | cut -d' ' -f1)"
+    l_sum="$(sha256sum -- "$live" | cut -d' ' -f1)" || { printf 'mismatch unreadable\n'; return 0; }
+    [ "$r_sum" = "$l_sum" ] || bad+=(sha256)
+  fi
+  if [ "${#bad[@]}" -eq 0 ]; then
+    printf 'match\n'
+  else
+    local IFS=,
+    printf 'mismatch %s\n' "${bad[*]}"
+  fi
+}
+
+# list_files ROOT SAMPLE -> NUL-separated relative paths of regular files,
+# all of them or SAMPLE random ones.
+list_files() {
+  local root="$1" sample="$2"
+  if [ "$sample" -gt 0 ]; then
+    find "$root" -type f -printf '%P\0' | shuf -z -n "$sample"
+  else
+    find "$root" -type f -printf '%P\0'
+  fi
+}
+
+# compare_tree ROOT SOURCE SAMPLE CHECK_OWNER
+# Prints per-file problem lines and a summary block; returns 1 on mismatch.
+compare_tree() {
+  local root="$1" source="$2" sample="$3" check_owner="$4"
+  local rel result checked=0 match=0 changed=0 missing=0 mismatch=0
+  while IFS= read -r -d '' rel; do
+    checked=$((checked + 1))
+    result="$(compare_file "$root/$rel" "$source/$rel" "$check_owner")"
+    case "$result" in
+      match) match=$((match + 1)) ;;
+      changed) changed=$((changed + 1)) ;;
+      missing) missing=$((missing + 1)) ;;
+      mismatch*)
+        mismatch=$((mismatch + 1))
+        printf 'MISMATCH (%s): %s\n' "${result#mismatch }" "$rel"
+        ;;
+    esac
+  done < <(list_files "$root" "$sample")
+
+  local scope="all files"
+  [ "$sample" -eq 0 ] || scope="random sample of ${sample}"
+  printf 'checked: %d (%s) against %s\n' "$checked" "$scope" "$source"
+  printf 'match: %d\n' "$match"
+  printf 'changed since backup: %d\n' "$changed"
+  printf 'gone from live tree: %d\n' "$missing"
+  printf 'mismatch: %d\n' "$mismatch"
+  [ "$check_owner" -eq 1 ] || printf 'owner/group: not checked (not running as root)\n'
+  if [ "$checked" -gt 0 ] && [ "$changed" -eq "$checked" ]; then
+    printf 'note: every file differs in mtime; the restore may not have preserved mtimes\n'
+  fi
+  [ "$mismatch" -eq 0 ]
+}
+
+# run_verify DRIVER BACKUP SCRATCH SOURCE ROOT SNAPSHOT SAMPLE KEEP
+# Prints the report; returns 0 on PASS, 1 on FAIL.
+run_verify() {
+  local driver="$1" backup="$2" scratch="$3" source="$4" root_rel="$5"
+  local snapshot="$6" sample="$7" keep="$8"
+
+  local dest
+  dest="$(mktemp -d "${scratch}/backup-verify.XXXXXX")" || die "cannot create a restore dir in $scratch"
+
+  printf 'backup-verify report\n'
+  printf 'backup: %s\n' "$backup"
+  printf 'driver: %s\n' "$driver"
+  printf 'started: %s\n' "$(date +"%Y-%m-%dT%H:%M:%S%z")"
+  printf 'restore dir: %s\n' "$dest"
+
+  local start end restore_rc=0 rc=0
+  start="$(now_ns)"
+  # The tool's own chatter goes to stderr so stdout stays a clean report.
+  restore "$driver" "$backup" "$dest" "$snapshot" >&2 || restore_rc=$?
+  end="$(now_ns)"
+  local secs
+  secs="$(format_ms $(((end - start) / 1000000)))"
+
+  if [ "$restore_rc" -ne 0 ]; then
+    printf 'restore: FAILED (rc=%d) after %ss\n' "$restore_rc" "$secs"
+    rc=1
+  else
+    printf 'restore: ok in %ss\n' "$secs"
+    local files bytes
+    files="$(find "$dest" -type f | wc -l)"
+    bytes="$(du -sb -- "$dest" | cut -f1)"
+    printf 'restored: %d file(s), %s\n' "$files" "$(human_bytes "$bytes")"
+    if [ "$driver" = "pg_restore" ] && [ ! -s "$dest/restore.sql" ]; then
+      printf 'pg_restore produced an empty script\n'
+      rc=1
+    fi
+
+    if [ -n "$source" ]; then
+      local root
+      if [ -n "$root_rel" ]; then
+        root="${dest}/${root_rel#/}"
+      else
+        root="$(default_root "$driver" "$source" "$dest")"
+      fi
+      if [ ! -d "$root" ]; then
+        printf 'restored tree has no %s; pass --root to say where SOURCE lives in the backup\n' \
+          "${root#"$dest"/}"
+        rc=1
+      else
+        local check_owner=0
+        [ "$(id -u)" -ne 0 ] || check_owner=1
+        compare_tree "$root" "$source" "$sample" "$check_owner" || rc=1
+      fi
+    fi
+  fi
+
+  if [ "$keep" -eq 1 ]; then
+    printf 'kept restore dir: %s\n' "$dest"
+  else
+    rm -rf -- "$dest"
+  fi
+  if [ "$rc" -eq 0 ]; then
+    printf 'result: PASS\n'
+  else
+    printf 'result: FAIL\n'
+  fi
+  return "$rc"
+}
+
+main() {
+  local driver=tar scratch="${TMPDIR:-/tmp}" source="" root_rel="" snapshot=latest
+  local sample=0 report="" keep=0
+  local -a positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -D|--driver) driver="$2"; shift 2 ;;
+      -s|--scratch) scratch="$2"; shift 2 ;;
+      -S|--source) source="$2"; shift 2 ;;
+      --root) root_rel="$2"; shift 2 ;;
+      --snapshot) snapshot="$2"; shift 2 ;;
+      -n|--sample) sample="$2"; shift 2 ;;
+      -r|--report) report="$2"; shift 2 ;;
+      -k|--keep-scratch) keep=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do positional+=("$1"); shift; done ;;
+      -*) die "unknown option: $1" ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+
+  [ "${#positional[@]}" -eq 1 ] || { usage >&2; die "exactly one BACKUP required"; }
+  is_uint "$sample" || die "--sample must be a non-negative integer"
+  sample=$((10#$sample))
+  local backup="${positional[0]}"
+
+  case "$driver" in
+    tar) require_cmd tar ;;
+    restic) require_cmd restic ;;
+    borg) require_cmd borg ;;
+    pg_restore) require_cmd pg_restore ;;
+    *) die "unknown driver: $driver (expected tar, restic, borg or pg_restore)" ;;
+  esac
+  require_cmd find stat sha256sum shuf du
+
+  case "$driver" in
+    # borg takes REPO::ARCHIVE and restic a repository URL or path, which
+    # need not exist locally (sftp:, s3:, ...), so only file-based backups
+    # are checked up front.
+    tar|pg_restore) [ -e "$backup" ] || die "backup not found: $backup" ;;
+  esac
+  [ -d "$scratch" ] || die "scratch directory not found: $scratch"
+
+  if [ -n "$source" ]; then
+    [ "$driver" != "pg_restore" ] || die "--source does not apply to the pg_restore driver"
+    [ -d "$source" ] || die "source directory not found: $source"
+    source="$(cd -- "$source" && pwd)"
+    # A restore dir under the live tree would mix restored files into it
+    # (and into the next backup of it).
+    if is_within "$scratch" "$source"; then
+      die "scratch dir $scratch is inside source $source; pick a scratch dir elsewhere"
+    fi
+  fi
+
+  local rc=0
+  if [ -n "$report" ]; then
+    mkdir -p -- "$(dirname -- "$report")"
+    # pipefail makes the pipeline report run_verify's status, not tee's.
+    run_verify "$driver" "$backup" "$scratch" "$source" "$root_rel" "$snapshot" "$sample" "$keep" \
+      | tee -- "$report" || rc=$?
+  else
+    run_verify "$driver" "$backup" "$scratch" "$source" "$root_rel" "$snapshot" "$sample" "$keep" || rc=$?
+  fi
+  return "$rc"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

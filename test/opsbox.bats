@@ -18,6 +18,24 @@ teardown() {
   [ "$status" -eq 0 ]
 }
 
+@test "is_command knows the newer subcommands" {
+  local c
+  for c in backup-verify logrotate-audit procwatch; do
+    run is_command "$c"
+    [ "$status" -eq 0 ]
+    [ -x "${REPO_ROOT}/bin/$c" ]
+  done
+}
+
+@test "every subcommand is installed by make install" {
+  run make -C "$REPO_ROOT" install DESTDIR="$TMP/root" PREFIX=/usr/local
+  [ "$status" -eq 0 ]
+  local c
+  for c in "${OPSBOX_COMMANDS[@]}"; do
+    [ -x "$TMP/root/usr/local/bin/$c" ]
+  done
+}
+
 @test "is_command rejects unknown names" {
   run is_command frobnicate
   [ "$status" -ne 0 ]
