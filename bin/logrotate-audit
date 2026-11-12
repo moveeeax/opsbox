@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+#
+# logrotate-audit - check that logrotate rules match real files and that
+# rotation will not break ownership, mode or a process holding the log open.
+#
+set -euo pipefail
+
+_LA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/common.sh
+source "${_LA_DIR}/../lib/common.sh"
+
+LA_CATEGORIES=(unmatched uncovered perms overlap open)
+
+usage() {
+  cat <<'EOF'
+Usage: logrotate-audit [OPTIONS]
+
+Read a logrotate configuration (following include directives), expand every
+log path glob and report:
+
+  unmatched   a path or glob in a rule that matches no file at all
+  uncovered   a file under --logdir that no rule covers (rotated copies such
+              as app.log.1, app.log.2.gz, app.log-20260101 are not counted)
+  perms       "create MODE OWNER GROUP" that differs from the file's current
+              mode/owner/group; "su USER GROUP" that differs from the file's
+              owner; a parent dir writable by group or others without "su",
+              which logrotate refuses to rotate in
+  overlap     a file claimed by more than one rule (logrotate rejects
+              duplicate entries), with each rule's rotate/frequency
+  open        a file held open by a running process whose rule has neither
+              postrotate nor copytruncate/copy, so the process keeps writing
+              to the rotated copy
+
+Each matched rule also gets a "retention" line: rotate count times the
+current size of its files, an upper bound for what rotation will keep before
+compression.
+
+Options:
+  -c, --config FILE     Main config (default: /etc/logrotate.conf)
+  -l, --logdir DIR      Directory scanned for uncovered files (default:
+                        /var/log)
+  -i, --ignore GLOB     Skip uncovered files whose basename matches GLOB
+                        (repeatable)
+  -f, --format FMT      table or tsv (default: table)
+      --fail-on LIST    Comma-separated categories that make the exit status
+                        1 when found, or "any" (default: none, exit 0)
+  -h, --help            Show this help and exit
+
+Only files this user can read are checked; run as root for the whole
+picture. Open files are found through /proc/PID/fd, which shows only this
+user's processes unless run as root.
+
+Example:
+  logrotate-audit --config /etc/logrotate.conf --logdir /var/log --fail-on unmatched,open
+EOF
+}
+
+# is_taboo NAME -> 0 for leftovers that logrotate skips in an included dir
+# (package-manager and editor backups).
+is_taboo() {
+  case "$1" in
+    *.dpkg-old|*.dpkg-dist|*.dpkg-new|*.dpkg-bak|*.dpkg-del|*.dpkg-tmp) return 0 ;;
+    *.rpmsave|*.rpmorig|*.rpmnew|*.ucf-old|*.ucf-dist|*.ucf-new) return 0 ;;
+    *.swp|*.disabled|*.cfsaved|*,v|*~) return 0 ;;
+  esac
+  return 1
+}
+
+# expand_config FILE [DEPTH] -> the config with every "include PATH" replaced
+# inline by the included file(s), in the order logrotate reads them
+# (directory entries sorted). Each file starts with a "#@file PATH" marker.
+expand_config() {
+  local file="$1" depth="${2:-0}"
+  [ "$depth" -lt 20 ] || die "include nesting too deep at $file"
+  [ -r "$file" ] || { warn "cannot read config: $file"; return 0; }
+  printf '#@file %s\n' "$file"
+  local line trimmed target f
+  while IFS= read -r line || [ -n "$line" ]; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    case "$trimmed" in
+      include[[:space:]]*)
+        target="${trimmed#include}"
+        target="${target#"${target%%[![:space:]]*}"}"
+        target="${target%"${target##*[![:space:]]}"}"
+        if [ -d "$target" ]; then
+          while IFS= read -r -d '' f; do
+            is_taboo "$f" || expand_config "$f" $((depth + 1))
+          done < <(find "$target" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z)
+        else
+          expand_config "$target" $((depth + 1))
+        fi
+        printf '#@file %s\n' "$file"
+        ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done < "$file"
+}
+
+# parse_rules -> reads expanded config on stdin and prints one line per
+# (rule, path pattern):
+#   rule_id<TAB>config_file<TAB>pattern<TAB>rotate<TAB>freq<TAB>create<TAB>su<TAB>postrotate<TAB>copytruncate
+# Global directives before a block become that block's defaults, as in
+# logrotate. "create" is "-" when off, "default" without arguments,
+# otherwise its arguments; "su" is "-" or "USER GROUP".
+parse_rules() {
+  awk '
+    function tokenize(s, out,    n, c, tok, inq, i) {
+      n = 0; tok = ""; inq = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\"") { inq = !inq; continue }
+        if (!inq && (c == " " || c == "\t")) {
+          if (tok != "") { out[++n] = tok; tok = "" }
+          continue
+        }
+        if (!inq && c == "{") {
+          if (tok != "") { out[++n] = tok; tok = "" }
+          out[++n] = "{"
+          continue
+        }
+        tok = tok c
+      }
+      if (tok != "") out[++n] = tok
+      return n
+    }
+    function apply(scope, t, n,    i, v) {
+      if (t[1] == "rotate" && n >= 2) cfg[scope, "rotate"] = t[2]
+      else if (t[1] ~ /^(hourly|daily|weekly|monthly|yearly)$/) cfg[scope, "freq"] = t[1]
+      else if (t[1] == "create") {
+        v = ""
+        for (i = 2; i <= n; i++) v = v (i > 2 ? " " : "") t[i]
+        cfg[scope, "create"] = (v == "" ? "default" : v)
+      }
+      else if (t[1] == "nocreate") cfg[scope, "create"] = "-"
+      else if (t[1] == "su" && n >= 2) cfg[scope, "su"] = t[2] " " (n >= 3 ? t[3] : t[2])
+      else if (t[1] == "copytruncate" || t[1] == "copy") cfg[scope, "copytruncate"] = 1
+      else if (t[1] == "nocopytruncate" || t[1] == "nocopy") cfg[scope, "copytruncate"] = 0
+    }
+    function open_block(    k) {
+      rule++
+      for (k in keys) cfg["r", k] = cfg["g", k]
+      cfg["r", "post"] = 0
+      inblock = 1
+    }
+    function close_block(    i) {
+      for (i = 1; i <= npat; i++)
+        printf "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\n", rule, rfile, pat[i],
+          cfg["r", "rotate"], cfg["r", "freq"], cfg["r", "create"], cfg["r", "su"],
+          cfg["r", "post"], cfg["r", "copytruncate"]
+      npat = 0; inblock = 0
+    }
+    BEGIN {
+      split("rotate freq create su copytruncate", tmp, " ")
+      for (i in tmp) keys[tmp[i]] = 1
+      # logrotate defaults: rotate 0, no create, no su.
+      cfg["g", "rotate"] = 0; cfg["g", "freq"] = "-"; cfg["g", "create"] = "-"
+      cfg["g", "su"] = "-"; cfg["g", "copytruncate"] = 0
+      rule = 0; npat = 0; inblock = 0; inscript = 0
+    }
+    /^#@file / { file = substr($0, 8); next }
+    {
+      line = $0
+      sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line)
+      if (inscript) { if (line ~ /^endscript/) inscript = 0; next }
+      if (line == "" || line ~ /^#/) next
+      delete t
+      n = tokenize(line, t)
+      if (inblock) {
+        if (t[1] == "}") { close_block(); next }
+        if (t[1] == "postrotate") { cfg["r", "post"] = 1; inscript = 1; next }
+        if (t[1] ~ /^(prerotate|firstaction|lastaction|preremove)$/) { inscript = 1; next }
+        apply("r", t, n)
+        next
+      }
+      first = substr(line, 1, 1)
+      if (first == "/" || first == "\"" || first == "~" || t[1] == "{") {
+        for (i = 1; i <= n; i++) {
+          if (t[i] == "{") { rfile = file; open_block() }
+          else if (!inblock) pat[++npat] = t[i]
+        }
+        next
+      }
+      apply("g", t, n)
+    }
+    END {
+      if (inblock) printf "logrotate-audit: unclosed block in %s\n", rfile > "/dev/stderr"
+    }
+  '
+}
+
+# expand_glob PATTERN -> regular files the pattern matches, one per line.
+expand_glob() {
+  local pattern="$1" f
+  local -a matches=()
+  # Only pathname expansion, no word splitting: patterns may hold spaces.
+  local IFS=
+  shopt -s nullglob
+  # shellcheck disable=SC2206
+  matches=($pattern)
+  shopt -u nullglob
+  for f in "${matches[@]}"; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# is_rotated_copy NAME -> 0 for names logrotate produces for old copies.
+is_rotated_copy() {
+  case "$1" in
+    *.[0-9]|*.[0-9][0-9]|*.[0-9][0-9][0-9]) return 0 ;;
+    *.gz|*.xz|*.bz2|*.zst|*.lz4|*.Z) return 0 ;;
+    *-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 0 ;;
+    *.old) return 0 ;;
+  esac
+  return 1
+}
+
+# octal_eq A B -> 0 if two octal mode strings are the same value.
+octal_eq() {
+  [ $((8#$1)) -eq $((8#$2)) ]
+}
+
+# check_create FILE CREATE -> a detail line if the file differs from CREATE.
+check_create() {
+  local file="$1" spec="$2"
+  [ "$spec" != "-" ] && [ "$spec" != "default" ] || return 0
+  local -a want
+  read -r -a want <<< "$spec"
+  local w_mode="" w_owner="" w_group=""
+  if [[ "${want[0]}" =~ ^[0-7]+$ ]]; then
+    w_mode="${want[0]}"; w_owner="${want[1]:-}"; w_group="${want[2]:-}"
+  else
+    w_owner="${want[0]:-}"; w_group="${want[1]:-}"
+  fi
+  local mode owner group uid gid
+  read -r mode owner group uid gid <<< "$(stat -c '%a %U %G %u %g' -- "$file")"
+  local bad=0
+  [ -z "$w_mode" ] || octal_eq "$w_mode" "$mode" || bad=1
+  [ -z "$w_owner" ] || [ "$w_owner" = "$owner" ] || [ "$w_owner" = "$uid" ] || bad=1
+  [ -z "$w_group" ] || [ "$w_group" = "$group" ] || [ "$w_group" = "$gid" ] || bad=1
+  [ "$bad" -eq 0 ] || printf 'create %s, but file is %s %s %s\n' "$spec" "$mode" "$owner" "$group"
+}
+
+# check_su FILE SU -> detail lines for su problems.
+check_su() {
+  local file="$1" su="$2" dir
+  dir="$(dirname -- "$file")"
+  local d_mode d_group d_gid
+  read -r d_mode d_group d_gid <<< "$(stat -c '%a %G %g' -- "$dir")"
+  local perm=$((8#$d_mode))
+  if [ "$su" = "-" ]; then
+    # logrotate refuses to rotate without su when the parent dir is
+    # writable by others, or by a group other than root (gid 0).
+    if [ $((perm & 8#002)) -ne 0 ] || { [ $((perm & 8#020)) -ne 0 ] && [ "$d_gid" -ne 0 ]; }; then
+      printf 'parent dir %s is writable by group %s or others and the rule has no su; logrotate skips it\n' \
+        "$dir" "$d_group"
+    fi
+    return 0
+  fi
+  local su_user su_group owner group
+  read -r su_user su_group <<< "$su"
+  read -r owner group <<< "$(stat -c '%U %G' -- "$file")"
+  if [ "$su_user" != "$owner" ] || [ "$su_group" != "$group" ]; then
+    printf 'su %s %s, but file is owned by %s:%s\n' "$su_user" "$su_group" "$owner" "$group"
+  fi
+}
+
+# audit CONFIG LOGDIR FORMAT IGNORE... -> findings, one per line, as
+# "category<TAB>path<TAB>detail" (tsv) or aligned columns (table).
+# Sets LA_FOUND_<category> counts for the caller.
+audit() {
+  local config="$1" logdir="$2" format="$3"
+  shift 3
+  local -a ignores=("$@")
+
+  local -a findings=()
+  local -A covered=() rule_label=() rule_retention=() rule_bytes=() open_by=()
+  local -A path_rules=()
+
+  # Who holds which file open, for the "open" check.
+  local proc pid fd target comm
+  proc="$(opsbox_proc_root)"
+  if [ -d "$proc" ]; then
+    while IFS=$'\t' read -r pid fd target; do
+      case "$target" in /*) ;; *) continue ;; esac
+      [ -z "${open_by[$target]:-}" ] || continue
+      comm="$(cat -- "$proc/$pid/comm" 2>/dev/null || printf '?')"
+      open_by[$target]="${pid} (${comm})"
+    done < <(proc_open_files)
+  fi
+
+  local rid cfile pattern rotate freq create su post copytrunc f matched detail
+  while IFS=$'\t' read -r rid cfile pattern rotate freq create su post copytrunc; do
+    # A rule is named after its first pattern in the retention lines.
+    [ -n "${rule_label[$rid]:-}" ] || rule_label[$rid]="$pattern"
+    matched=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      matched=$((matched + 1))
+      covered[$f]=1
+      path_rules[$f]+="${rid}:rotate ${rotate} ${freq} (${cfile});"
+      rule_bytes[$rid]=$(( ${rule_bytes[$rid]:-0} + $(stat -c '%s' -- "$f") ))
+      detail="$(check_create "$f" "$create")"
+      [ -z "$detail" ] || findings+=("perms"$'\t'"$f"$'\t'"$detail")
+      detail="$(check_su "$f" "$su")"
+      [ -z "$detail" ] || findings+=("perms"$'\t'"$f"$'\t'"$detail")
+      if [ "$post" -eq 0 ] && [ "$copytrunc" -eq 0 ] && [ -n "${open_by[$f]:-}" ]; then
+        findings+=("open"$'\t'"$f"$'\t'"held open by pid ${open_by[$f]}; rule has no postrotate or copytruncate")
+      fi
+    done < <(expand_glob "$pattern")
+    if [ "$matched" -eq 0 ]; then
+      findings+=("unmatched"$'\t'"$pattern"$'\t'"no file matches (rule in ${cfile})")
+    fi
+    rule_retention[$rid]="${rotate}"$'\t'"${freq}"
+  done < <(expand_config "$config" | parse_rules)
+
+  # Overlaps: one path, several rules.
+  local claims joined p ret
+  local -a parts=()
+  local -A distinct=()
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    claims="${path_rules[$f]}"
+    IFS=';' read -r -a parts <<< "${claims%;}"
+    [ "${#parts[@]}" -gt 1 ] || continue
+    joined=""
+    distinct=()
+    for p in "${parts[@]}"; do
+      ret="${p#*:}"
+      joined+="${joined:+, }${ret}"
+      distinct["${ret%% (*}"]=1
+    done
+    detail="claimed by ${#parts[@]} rules: ${joined}"
+    [ "${#distinct[@]}" -le 1 ] || detail+="; conflicting retention"
+    findings+=("overlap"$'\t'"$f"$'\t'"$detail")
+  done < <(printf '%s\n' "${!path_rules[@]}" | sort)
+
+  # Uncovered: real logs no rule matches.
+  if [ -d "$logdir" ]; then
+    local name g skip
+    while IFS= read -r -d '' f; do
+      [ -z "${covered[$f]:-}" ] || continue
+      name="${f##*/}"
+      is_rotated_copy "$name" && continue
+      skip=0
+      for g in "${ignores[@]}"; do
+        # shellcheck disable=SC2053
+        [[ "$name" == $g ]] && { skip=1; break; }
+      done
+      [ "$skip" -eq 0 ] || continue
+      findings+=("uncovered"$'\t'"$f"$'\t'"no logrotate rule matches this file")
+    done < <(find "$logdir" -type f -print0 2>/dev/null | sort -z)
+  else
+    warn "log directory not found: $logdir"
+  fi
+
+  # Retention estimate per rule that matched something.
+  local rot fq bytes
+  for rid in $(printf '%s\n' "${!rule_bytes[@]}" | sort -n); do
+    IFS=$'\t' read -r rot fq <<< "${rule_retention[$rid]}"
+    bytes="${rule_bytes[$rid]}"
+    findings+=("retention"$'\t'"${rule_label[$rid]}"$'\t'"rotate ${rot} ${fq}: ${rot} x $(human_bytes "$bytes") = up to $(human_bytes $((rot * bytes))) kept")
+  done
+
+  local line cat path
+  for cat in "${LA_CATEGORIES[@]}"; do
+    printf -v "LA_FOUND_${cat}" '%d' 0
+  done
+  for line in "${findings[@]}"; do
+    IFS=$'\t' read -r cat path detail <<< "$line"
+    if [ "$cat" != "retention" ]; then
+      local var="LA_FOUND_${cat}"
+      printf -v "$var" '%d' $(( ${!var} + 1 ))
+    fi
+    if [ "$format" = "tsv" ]; then
+      printf '%s\t%s\t%s\n' "$cat" "$path" "$detail"
+    else
+      printf '%-10s %s\n%-10s   %s\n' "$cat" "$path" "" "$detail"
+    fi
+  done
+}
+
+main() {
+  local config=/etc/logrotate.conf logdir=/var/log format=table fail_on=""
+  local -a ignores=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -c|--config) config="$2"; shift 2 ;;
+      -l|--logdir) logdir="$2"; shift 2 ;;
+      -i|--ignore) ignores+=("$2"); shift 2 ;;
+      -f|--format) format="$2"; shift 2 ;;
+      --fail-on) fail_on="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) usage >&2; die "unexpected argument: $1" ;;
+    esac
+  done
+  case "$format" in
+    table|tsv) ;;
+    *) die "--format must be table or tsv" ;;
+  esac
+
+  local -a fail_cats=()
+  if [ "$fail_on" = "any" ]; then
+    fail_cats=("${LA_CATEGORIES[@]}")
+  elif [ -n "$fail_on" ]; then
+    local c k known
+    IFS=',' read -r -a fail_cats <<< "$fail_on"
+    for c in "${fail_cats[@]}"; do
+      known=0
+      for k in "${LA_CATEGORIES[@]}"; do [ "$c" = "$k" ] && known=1; done
+      [ "$known" -eq 1 ] || die "unknown --fail-on category: $c (expected ${LA_CATEGORIES[*]} or any)"
+    done
+  fi
+
+  [ -r "$config" ] || die "config not readable: $config"
+  require_cmd awk find sort stat
+
+  audit "$config" "$logdir" "$format" "${ignores[@]}"
+
+  local rc=0 c var summary=""
+  for c in "${LA_CATEGORIES[@]}"; do
+    var="LA_FOUND_${c}"
+    summary+="${summary:+, }${c}=${!var}"
+  done
+  info "summary: ${summary}"
+  for c in "${fail_cats[@]}"; do
+    var="LA_FOUND_${c}"
+    [ "${!var}" -eq 0 ] || rc=1
+  done
+  return "$rc"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

@@ -6,8 +6,8 @@
 #
 #   source "$(dirname "$0")/../lib/common.sh"
 #
-# It provides timestamped logging, command checks, temp-dir management and
-# a small retry helper. It does not enable errexit itself so that callers
+# It provides timestamped logging, command checks, temp-dir management,
+# size parsing/formatting, procfs readers and a small retry helper. It does not enable errexit itself so that callers
 # keep control over their own shell options.
 
 # Colour output only when stderr is a terminal.
@@ -75,6 +75,81 @@ is_uint() {
     ''|*[!0-9]*) return 1 ;;
     *) return 0 ;;
   esac
+}
+
+# parse_size SIZE -> bytes. Accepts plain integer or a B/K/M/G/T suffix
+# (case-insensitive, powers of 1024).
+parse_size() {
+  local s="$1" num unit
+  num="${s%[KkMmGgTtBb]}"
+  unit="${s#"$num"}"
+  case "$num" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$unit" in
+    ''|B|b) printf '%s\n' "$num" ;;
+    K|k) printf '%s\n' $((num * 1024)) ;;
+    M|m) printf '%s\n' $((num * 1024 * 1024)) ;;
+    G|g) printf '%s\n' $((num * 1024 * 1024 * 1024)) ;;
+    T|t) printf '%s\n' $((num * 1024 * 1024 * 1024 * 1024)) ;;
+    *) return 1 ;;
+  esac
+}
+
+# human_bytes N -> e.g. "1.5K", "3.0M", "2.1G". A negative N keeps its sign.
+human_bytes() {
+  local bytes="$1" sign=""
+  if [ "$bytes" -lt 0 ]; then
+    sign="-"
+    bytes=$((-bytes))
+  fi
+  local -a units=(B K M G T P)
+  local i=0
+  # Work in tenths to keep one decimal without floating point.
+  local value=$((bytes * 10))
+  while [ "$value" -ge 10240 ] && [ "$i" -lt $((${#units[@]} - 1)) ]; do
+    value=$((value / 1024))
+    i=$((i + 1))
+  done
+  printf '%s%d.%d%s\n' "$sign" $((value / 10)) $((value % 10)) "${units[i]}"
+}
+
+# opsbox_proc_root - where procfs is read from. Tests point OPSBOX_PROC at a
+# fixture tree; everything else gets /proc.
+opsbox_proc_root() {
+  printf '%s\n' "${OPSBOX_PROC:-/proc}"
+}
+
+# proc_open_files -> "pid<TAB>fd<TAB>target" for every file descriptor this
+# user can see under procfs. Processes owned by other users are skipped
+# silently unless running as root, the same as ls -l /proc/PID/fd would.
+proc_open_files() {
+  local proc pid_dir fd target
+  proc="$(opsbox_proc_root)"
+  for pid_dir in "$proc"/[0-9]*; do
+    [ -d "$pid_dir/fd" ] || continue
+    for fd in "$pid_dir"/fd/*; do
+      target="$(readlink -- "$fd" 2>/dev/null)" || continue
+      printf '%s\t%s\t%s\n' "${pid_dir##*/}" "${fd##*/}" "$target"
+    done
+  done
+}
+
+# deleted_open_files -> "bytes<TAB>pid<TAB>fd<TAB>path" for each descriptor
+# that still points at an unlinked file. Space held this way is invisible to
+# du but still counted by df until the process closes the file or exits.
+deleted_open_files() {
+  local proc pid fd target bytes
+  proc="$(opsbox_proc_root)"
+  while IFS=$'\t' read -r pid fd target; do
+    case "$target" in
+      *' (deleted)') ;;
+      *) continue ;;
+    esac
+    # stat -L follows the /proc magic link to the unlinked inode itself.
+    bytes="$(stat -L -c '%s' -- "$proc/$pid/fd/$fd" 2>/dev/null)" || continue
+    printf '%s\t%s\t%s\t%s\n' "$bytes" "$pid" "$fd" "${target% (deleted)}"
+  done < <(proc_open_files)
 }
 
 # make_tmpdir [PREFIX] - create a temp dir and echo its path.

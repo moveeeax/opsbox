@@ -12,33 +12,43 @@ source "${_DR_DIR}/../lib/common.sh"
 usage() {
   cat <<'EOF'
 Usage: disk-report [OPTIONS] [PATH...]
+       disk-report --snapshot FILE [--depth N] [PATH...]
+       disk-report --since FILE [--top N] [--min-growth SIZE] [PATH...]
 
 Report the size of each PATH and the usage of the filesystem that holds it.
 Paths whose filesystem usage meets or exceeds the threshold are flagged.
 
-Options:
-  -t, --threshold PCT   Warn when filesystem use% >= PCT (default: 90)
-  -h, --help            Show this help and exit
+With --snapshot, record the size of every directory under each PATH down to
+--depth levels instead. With --since, rescan and print the directories that
+grew the most compared with an earlier snapshot.
 
-If no PATH is given, the current directory is used.
+Options:
+  -t, --threshold PCT    Warn when filesystem use% >= PCT (default: 90)
+      --snapshot FILE    Write "bytes<TAB>path" for each directory to FILE
+      --since FILE       Show growth since the snapshot in FILE
+  -n, --depth N          Directory depth for --snapshot/--since (default: 2;
+                         --since defaults to the depth stored in FILE)
+      --top N            Number of paths --since prints (default: 10)
+      --min-growth SIZE  Hide paths that grew by less than SIZE (bytes, or
+                         with a B/K/M/G/T suffix). Default: 1 byte
+      --cross-mounts     Let the scan descend into other filesystems
+                         (default: stay on the filesystem of each PATH)
+      --deleted          Also list deleted files still held open by a
+                         process: space df counts but du cannot see
+  -h, --help             Show this help and exit
+
+If no PATH is given, the current directory is used; --since without a PATH
+rescans the paths recorded in the snapshot.
+
+Sizes are apparent sizes (du -b). Snapshots are plain text, so a cron job
+can keep one per day:
+
+  disk-report --snapshot /var/lib/opsbox/disk-$(date +%F).tsv /var
+  disk-report --since /var/lib/opsbox/disk-2026-11-01.tsv --top 20
 
 Example:
   disk-report --threshold 80 / /var /home
 EOF
-}
-
-# human_bytes N -> e.g. "1.5K", "3.0M", "2.1G".
-human_bytes() {
-  local bytes="$1"
-  local -a units=(B K M G T P)
-  local i=0
-  # Work in tenths to keep one decimal without floating point.
-  local value=$((bytes * 10))
-  while [ "$value" -ge 10240 ] && [ "$i" -lt $((${#units[@]} - 1)) ]; do
-    value=$((value / 1024))
-    i=$((i + 1))
-  done
-  printf '%d.%d%s\n' $((value / 10)) $((value % 10)) "${units[i]}"
 }
 
 # du_bytes PATH -> apparent disk usage in bytes.
@@ -74,12 +84,177 @@ report_path() {
   return 0
 }
 
+# abs_path PATH -> PATH made absolute (logical, symlinks kept), so snapshot
+# entries match no matter which directory the next run starts from.
+abs_path() {
+  local p="$1"
+  if [ -d "$p" ]; then
+    (cd -- "$p" && pwd)
+  else
+    case "$p" in
+      /*) printf '%s\n' "$p" ;;
+      *) printf '%s/%s\n' "$(pwd)" "$p" ;;
+    esac
+  fi
+}
+
+# scan_sizes DEPTH CROSS(0|1) ROOT... -> "bytes<TAB>path" per directory.
+# Returns du's exit status: nonzero when some subtree could not be read, in
+# which case the output is still produced but undercounts those subtrees.
+scan_sizes() {
+  local depth="$1" cross="$2"
+  shift 2
+  local -a opts=(-b "--max-depth=${depth}")
+  [ "$cross" -eq 1 ] || opts+=(-x)
+  du "${opts[@]}" -- "$@"
+}
+
+# write_snapshot FILE DEPTH CROSS ROOT...
+# Header lines start with "#"; everything else is "bytes<TAB>path". The file
+# is written next to its destination and renamed into place, so an
+# interrupted run never leaves a half-written snapshot under FILE.
+write_snapshot() {
+  local file="$1" depth="$2" cross="$3"
+  shift 3
+  local dir tmp root du_rc=0
+  dir="$(dirname -- "$file")"
+  mkdir -p -- "$dir"
+  tmp="$(mktemp "${dir}/.disk-report.XXXXXX")" || die "cannot create a temp file in $dir"
+  {
+    printf '# disk-report snapshot\n'
+    printf '# taken\t%s\n' "$(date +"%Y-%m-%dT%H:%M:%S%z")"
+    printf '# epoch\t%s\n' "$(date +%s)"
+    printf '# depth\t%s\n' "$depth"
+    for root in "$@"; do
+      printf '# root\t%s\n' "$root"
+    done
+    scan_sizes "$depth" "$cross" "$@" || du_rc=$?
+  } > "$tmp" || { rm -f -- "$tmp"; die "failed writing snapshot $file"; }
+  mv -f -- "$tmp" "$file"
+  if [ "$du_rc" -ne 0 ]; then
+    warn "du exited ${du_rc}; unreadable directories are undercounted in $file"
+    return 1
+  fi
+}
+
+# snapshot_field FILE KEY -> each value stored as "# KEY<TAB>value".
+snapshot_field() {
+  awk -F'\t' -v key="# $2" '$1 == key { print $2 }' "$1"
+}
+
+# snapshot_diff OLD NEW TOP MIN_BYTES
+# -> "growth<TAB>old_bytes<TAB>new_bytes<TAB>path", largest growth first,
+# at most TOP lines. old_bytes is "-" for a path missing from OLD. Paths
+# that shrank, stayed the same or grew by less than MIN_BYTES are dropped.
+snapshot_diff() {
+  local old="$1" new="$2" top="$3" min="$4"
+  awk -F'\t' -v oldf="$old" -v min="$min" '
+    /^#/ { next }
+    FILENAME == oldf { size[$2] = $1; next }
+    {
+      if ($2 in size) {
+        g = $1 - size[$2]
+        if (g > 0 && g >= min) printf "%.0f\t%.0f\t%.0f\t%s\n", g, size[$2], $1, $2
+      } else if ($1 > 0 && $1 >= min) {
+        printf "%.0f\t-\t%.0f\t%s\n", $1, $1, $2
+      }
+    }
+  ' "$old" "$new" | sort -t$'\t' -k1,1nr | awk -v top="$top" 'NR <= top'
+}
+
+# format_growth -> human lines from snapshot_diff output on stdin, e.g.
+#   +3.2G    /var/lib/docker/overlay2 (was 11.0G, now 14.2G)
+#   +1.0G    /var/log/new-app (new, now 1.0G)
+format_growth() {
+  local growth old new path
+  while IFS=$'\t' read -r growth old new path; do
+    if [ "$old" = "-" ]; then
+      printf '%-8s %s (new, now %s)\n' "+$(human_bytes "$growth")" "$path" "$(human_bytes "$new")"
+    else
+      printf '%-8s %s (was %s, now %s)\n' "+$(human_bytes "$growth")" "$path" \
+        "$(human_bytes "$old")" "$(human_bytes "$new")"
+    fi
+  done
+}
+
+# report_since FILE DEPTH(empty = from FILE) TOP MIN CROSS ROOT...
+report_since() {
+  local file="$1" depth="$2" top="$3" min="$4" cross="$5"
+  shift 5
+  [ -f "$file" ] || die "snapshot not found: $file"
+  local taken stored_depth
+  taken="$(snapshot_field "$file" taken)"
+  stored_depth="$(snapshot_field "$file" depth)"
+  [ -n "$stored_depth" ] || die "not a disk-report snapshot: $file"
+
+  local -a roots=("$@")
+  if [ "${#roots[@]}" -eq 0 ]; then
+    local r
+    while IFS= read -r r; do
+      roots+=("$r")
+    done < <(snapshot_field "$file" root)
+  fi
+  [ "${#roots[@]}" -gt 0 ] || die "no PATH given and none recorded in $file"
+  if [ -z "$depth" ]; then
+    depth="$stored_depth"
+  elif [ "$depth" != "$stored_depth" ]; then
+    warn "snapshot was taken at depth ${stored_depth}, scanning at ${depth}: paths at other depths show up as new"
+  fi
+
+  local tmpdir current rc=0
+  tmpdir="$(make_tmpdir disk-report)"
+  current="${tmpdir}/current.tsv"
+  write_snapshot "$current" "$depth" "$cross" "${roots[@]}" || rc=1
+
+  info "growth since ${taken:-unknown time} (${file})"
+  local diff
+  diff="$(snapshot_diff "$file" "$current" "$top" "$min")"
+  if [ -n "$diff" ]; then
+    printf '%s\n' "$diff" | format_growth
+  else
+    info "nothing grew by at least $(human_bytes "$min")"
+  fi
+  cleanup_tmpdirs
+  return "$rc"
+}
+
+# report_deleted -> deleted-but-open files, largest first, with the process
+# holding each one. Prints nothing (and says so) when there are none.
+report_deleted() {
+  local proc
+  proc="$(opsbox_proc_root)"
+  if [ ! -d "$proc" ]; then
+    warn "procfs not available at ${proc}; cannot look for deleted open files"
+    return 0
+  fi
+  local listing
+  listing="$(deleted_open_files | sort -t$'\t' -k1,1nr)"
+  if [ -z "$listing" ]; then
+    info "no deleted files held open"
+    return 0
+  fi
+  printf 'deleted but still open (counted by df, invisible to du):\n'
+  local bytes pid fd path comm
+  while IFS=$'\t' read -r bytes pid fd path; do
+    comm="$(cat -- "$proc/$pid/comm" 2>/dev/null || printf '?')"
+    printf '  %-8s pid=%s (%s) fd=%s %s\n' "$(human_bytes "$bytes")" "$pid" "$comm" "$fd" "$path"
+  done <<< "$listing"
+}
+
 main() {
-  local threshold=90
+  local threshold=90 snapshot="" since="" depth="" top=10 min_spec=1
+  local cross=0 deleted=0
   local -a paths=()
   while [ $# -gt 0 ]; do
     case "$1" in
       -t|--threshold) threshold="$2"; shift 2 ;;
+      --snapshot) snapshot="$2"; shift 2 ;;
+      --since) since="$2"; shift 2 ;;
+      -n|--depth) depth="$2"; shift 2 ;;
+      --top) top="$2"; shift 2 ;;
+      --min-growth) min_spec="$2"; shift 2 ;;
+      --cross-mounts) cross=1; shift ;;
+      --deleted) deleted=1; shift ;;
       -h|--help) usage; exit 0 ;;
       --) shift; while [ $# -gt 0 ]; do paths+=("$1"); shift; done ;;
       -*) die "unknown option: $1" ;;
@@ -87,14 +262,39 @@ main() {
     esac
   done
   is_uint "$threshold" || die "--threshold must be an integer"
-  [ "${#paths[@]}" -gt 0 ] || paths=(".")
+  [ -z "$depth" ] || is_uint "$depth" || die "--depth must be a non-negative integer"
+  is_uint "$top" || die "--top must be a non-negative integer"
+  local min
+  min="$(parse_size "$min_spec")" || die "invalid --min-growth: $min_spec"
+  if [ -n "$snapshot" ] && [ -n "$since" ]; then
+    die "--snapshot and --since are mutually exclusive"
+  fi
 
-  require_cmd du df awk
+  require_cmd du df awk sort
 
   local rc=0 p
-  for p in "${paths[@]}"; do
-    report_path "$p" "$threshold" || rc=1
-  done
+  local -a roots=()
+  if [ -n "$snapshot" ] || [ -n "$since" ]; then
+    for p in "${paths[@]}"; do
+      [ -e "$p" ] || die "path not found: $p"
+      roots+=("$(abs_path "$p")")
+    done
+  fi
+
+  if [ -n "$snapshot" ]; then
+    [ "${#roots[@]}" -gt 0 ] || roots=("$(pwd)")
+    write_snapshot "$snapshot" "${depth:-2}" "$cross" "${roots[@]}" || rc=1
+    info "wrote snapshot: $snapshot"
+  elif [ -n "$since" ]; then
+    report_since "$since" "$depth" "$top" "$min" "$cross" "${roots[@]}" || rc=1
+  else
+    [ "${#paths[@]}" -gt 0 ] || paths=(".")
+    for p in "${paths[@]}"; do
+      report_path "$p" "$threshold" || rc=1
+    done
+  fi
+
+  [ "$deleted" -eq 0 ] || report_deleted
   return "$rc"
 }
 

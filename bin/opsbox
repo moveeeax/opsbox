@@ -9,7 +9,7 @@ _OB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "${_OB_DIR}/../lib/common.sh"
 
-OPSBOX_COMMANDS=(backup disk-report healthcheck logrotate-lite prune-old)
+OPSBOX_COMMANDS=(backup backup-verify disk-report healthcheck logrotate-audit logrotate-lite procwatch prune-old)
 
 usage() {
   cat <<EOF
@@ -20,9 +20,12 @@ own options.
 
 Commands:
   backup           Create timestamped tar.gz archives and rotate old ones
-  disk-report      Report disk usage with threshold warnings
+  backup-verify    Restore a backup into a scratch dir and check it
+  disk-report      Report disk usage, snapshot it, show what grew
   healthcheck      Probe host:port and http(s) targets
+  logrotate-audit  Find logrotate rules that match nothing, uncovered logs
   logrotate-lite   Size-based logfile rotation with optional gzip
+  procwatch        Report processes over CPU, RSS, fd or thread limits
   prune-old        Delete files older than N days (dry-run by default)
 
 Examples:

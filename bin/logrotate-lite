@@ -29,25 +29,6 @@ Example:
 EOF
 }
 
-# parse_size SIZE -> bytes. Accepts plain integer or a B/K/M/G/T suffix
-# (case-insensitive).
-parse_size() {
-  local s="$1" num unit
-  num="${s%[KkMmGgTtBb]}"
-  unit="${s#"$num"}"
-  case "$num" in
-    ''|*[!0-9]*) return 1 ;;
-  esac
-  case "$unit" in
-    ''|B|b) printf '%s\n' "$num" ;;
-    K|k) printf '%s\n' $((num * 1024)) ;;
-    M|m) printf '%s\n' $((num * 1024 * 1024)) ;;
-    G|g) printf '%s\n' $((num * 1024 * 1024 * 1024)) ;;
-    T|t) printf '%s\n' $((num * 1024 * 1024 * 1024 * 1024)) ;;
-    *) return 1 ;;
-  esac
-}
-
 # file_size PATH -> size in bytes (0 if missing).
 file_size() {
   if [ -f "$1" ]; then

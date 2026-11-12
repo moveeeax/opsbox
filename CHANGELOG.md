@@ -7,6 +7,25 @@ loosely based on [Keep a Changelog](https://keepachangelog.com/).
 
 Planned as 0.2.0 (`VERSION` already reads `0.2.0`).
 
+### Added
+- `backup-verify`: restore a backup into a scratch dir (tar, restic, borg or
+  pg_restore driver), compare checksum, size, mode and owner with the live
+  tree, optionally on a random sample, record the restore time and exit 1 on
+  failure. Carried over from the archived `backup-verify` stub (#3).
+- `disk-report --snapshot FILE` / `--since FILE`: plain-text per-directory
+  size snapshots and a "what grew" report ranked by growth, with `--depth`,
+  `--top`, `--min-growth` and `--cross-mounts` (#8, #4).
+- `disk-report --deleted`: deleted files still held open by a process (#4).
+- `logrotate-audit`: rules that match nothing, uncovered logs, `create`/`su`
+  checks, overlapping rules, open files rotated without a reload, and a
+  retention estimate per rule (#5).
+- `procwatch`: RSS, CPU, fd (absolute or percent of limit) and thread rules
+  with sustained windows, reporting argv, parent chain, cgroup/unit and start
+  time, with an exec hook and per-trigger snapshots (#6).
+- `lib/common.sh`: `parse_size` and `human_bytes` (moved from `logrotate-lite`
+  and `disk-report`; `human_bytes` now keeps a minus sign), `opsbox_proc_root`,
+  `proc_open_files` and `deleted_open_files`.
+
 ### Fixed
 - `opsbox --version` printed `unknown` after `make install`, because the
   `VERSION` file was never installed. `make install` now copies it to
